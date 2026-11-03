@@ -7,13 +7,14 @@ settings:
 importers:
 
   .:
+    dependencies:
+      node-gyp:
+        specifier: ^13.1.0
+        version: 13.1.0
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
         version: 24.19.2
-      node-gyp:
-        specifier: ^13.1.0
-        version: 13.1.0
       typescript:
         specifier: ^5.9.0
         version: 5.9.3

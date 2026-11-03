@@ -2,20 +2,43 @@
   "name": "letsclean",
   "version": "0.1.0",
   "description": "OmniDiskSweeper-style terminal disk usage explorer",
+  "keywords": [
+    "disk",
+    "disk-usage",
+    "cli",
+    "cleanup",
+    "node-modules",
+    "terminal"
+  ],
+  "license": "MIT",
+  "author": "Farnabaz <farnabaz@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/farnabaz/letsclean.git"
+  },
+  "homepage": "https://github.com/farnabaz/letsclean#readme",
+  "bugs": {
+    "url": "https://github.com/farnabaz/letsclean/issues"
+  },
   "type": "module",
   "bin": {
     "letsclean": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/index.ts",
-    "build": "node-gyp rebuild --directory native && tsc",
+    "build": "tsc",
     "rebuild": "node-gyp rebuild --directory native",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=22.18"
   },
-  "license": "MIT",
   "devDependencies": {
     "@types/node": "^24.0.0",
     "node-gyp": "^13.1.0",
