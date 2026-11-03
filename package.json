@@ -8,7 +8,8 @@
   },
   "scripts": {
     "start": "node src/index.ts",
-    "build": "tsc",
+    "build": "node-gyp rebuild --directory native && tsc",
+    "rebuild": "node-gyp rebuild --directory native",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
@@ -17,6 +18,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "node-gyp": "^13.1.0",
     "typescript": "^5.9.0"
   }
 }

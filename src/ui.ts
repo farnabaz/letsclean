@@ -29,21 +29,22 @@ interface ColCache {
 
 const orderCache = new WeakMap<Entry, ColCache>();
 
-function ordered(entry: Entry, showHidden: boolean, now: number, force: boolean, watching: boolean): Entry[] {
+function ordered(entry: Entry, showHidden: boolean): Entry[] {
   const kids = entry.children;
   if (!kids) return [];
   const cache = orderCache.get(entry);
   if (cache && cache.hidden === showHidden && cache.gen === entry.gen) return cache.list;
-  // Off-screen columns and huge folders don't need a fresh sort every frame.
-  // Sizes are still live; only the row order lags, and only while scanning.
-  if (cache && cache.hidden === showHidden && !force) {
-    if (!watching) return cache.list;
-    if (now - cache.at < 120 && kids.length > 2000) return cache.list;
-  }
   const list = showHidden ? kids.slice() : kids.filter((child) => child.name.charCodeAt(0) !== 46);
   list.sort((a, b) => b.size - a.size || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  orderCache.set(entry, { gen: entry.gen, at: now, hidden: showHidden, list });
+  orderCache.set(entry, { gen: entry.gen, at: 0, hidden: showHidden, list });
   return list;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 10_000) return (ms / 1000).toFixed(1) + "s";
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return seconds + "s";
+  return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
 }
 
 function matches(entry: Entry, query: string): boolean {
@@ -157,6 +158,10 @@ export function runUI(rootPath: string): void {
   let lastRateAt = Date.now();
   let rate = 0;
   let stopped = false;
+  const startedAt = Date.now();
+  let finishedIn: number | null = null;
+  let rss = process.memoryUsage().rss;
+  let lastRssAt = 0;
 
   function note(text: string): void {
     state.message = text;
@@ -170,8 +175,7 @@ export function runUI(rootPath: string): void {
   function activeList(force: boolean): Entry[] {
     const dir = activeDir();
     if (!dir) return [];
-    const now = Date.now();
-    const list = ordered(dir, state.showHidden, now, force, true);
+    const list = ordered(dir, state.showHidden);
     if (!state.query) return list;
     const query = state.query.toLowerCase();
     return list.filter((entry) => matches(entry, query));
@@ -253,11 +257,15 @@ export function runUI(rootPath: string): void {
     if (blocked || stopped) return;
     lastRender = Date.now();
     const now = lastRender;
-    if (now - lastRateAt >= 400 && scanner) {
-      const files = scanner.stats.files;
-      rate = ((files - lastFiles) * 1000) / (now - lastRateAt);
-      lastFiles = files;
-      lastRateAt = now;
+    if (scanner && !scanner.stats.done) {
+      if (now - lastRateAt >= 400) {
+        const files = scanner.stats.files;
+        rate = ((files - lastFiles) * 1000) / (now - lastRateAt);
+        lastFiles = files;
+        lastRateAt = now;
+      }
+    } else if (scanner && finishedIn === null) {
+      finishedIn = now - startedAt;
     }
     const frame = render(now);
     blocked = !process.stdout.write(frame);
@@ -270,11 +278,26 @@ export function runUI(rootPath: string): void {
     const total = root ? formatSize(root.size).trim() : "…";
     const stats = scanner?.stats;
     const scanning = stats && !stats.done;
+    if (now - lastRssAt > 1000) {
+      rss = process.memoryUsage().rss;
+      lastRssAt = now;
+    }
+    const elapsed = formatDuration(finishedIn ?? now - startedAt);
+    const memory = formatSize(Math.max(stats?.memory ?? 0, rss)).trim();
+    const files = formatCount(stats?.files ?? 0);
+    const dirs = formatCount(stats?.dirs ?? 0);
+    const errors = stats && stats.errors > 0 ? `  ${formatCount(stats.errors)} skipped` : "";
+    const wide = cols >= 110;
+    const counts = wide ? `${files} files  ${dirs} dirs` : `${files} files`;
     const status = scanning
-      ? `${spin} ${formatCount(stats.files)} files  ${formatCount(stats.dirs)} dirs  ${formatRate(rate)}  ${stats.inFlight} workers`
-      : `done  ${formatCount(stats?.files ?? 0)} files  ${formatCount(stats?.dirs ?? 0)} dirs`;
-    const title = ` letsclean  ${fit(rootPath, Math.max(8, cols - status.length - total.length - 16))}  ${BOLD}${total}${RESET}${HEADER}`;
-    lines.push(HEADER + padVisible(title, cols) + RESET);
+      ? `${spin} ${counts}  ${formatRate(rate)}  ${memory}  ${BOLD}${elapsed}${RESET}${HEADER}`
+      : `${BOLD}done in ${elapsed}${RESET}${HEADER}  ${counts}  ${memory}${errors}`;
+    // Status is placed from the right edge so it stays visible as the terminal
+    // narrows; the path takes whatever room is left.
+    const right = `  ${total}   ${status}${scanning ? errors : ""} `;
+    const pathWidth = Math.max(0, cols - visibleWidth(stripAnsi(right)) - 12);
+    const title = ` letsclean  ${fit(rootPath, pathWidth)}`;
+    lines.push(HEADER + padVisible(title, cols - visibleWidth(stripAnsi(right))) + right + RESET);
 
     const listH = Math.max(1, rows - 4);
     const shown = visibleStack();
@@ -293,7 +316,7 @@ export function runUI(rootPath: string): void {
 
     const lists = shown.map((dir, index) => {
       const isActive = index === shown.length - 1;
-      const list = ordered(dir, state.showHidden, now, false, isActive);
+      const list = ordered(dir, state.showHidden);
       if (isActive && state.query) return list.filter((entry) => matches(entry, state.query.toLowerCase()));
       return list;
     });
@@ -350,10 +373,10 @@ export function runUI(rootPath: string): void {
     } else if (state.message && now < state.messageUntil) {
       foot = YELLOW + " " + state.message + RESET;
     } else if (state.filtering) {
-      foot = `${BOLD}/${state.query}${RESET}  type to filter   ↑↓ move   esc clear   enter open`;
+      foot = `${BOLD}/${state.query}${RESET}  type to filter   ↑↓ move   ^o reveal   ^d trash   ^y copy   esc clear`;
     } else {
       const hidden = state.showHidden ? "shown" : "hidden";
-      foot = ` ${BOLD}↑↓${RESET} move  ${BOLD}→${RESET} open  ${BOLD}←${RESET} back  ${BOLD}o${RESET} finder  ${BOLD}d${RESET} trash  ${BOLD}y${RESET} copy  ${BOLD}.${RESET} ${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
+      foot = ` ${BOLD}↑↓${RESET} move  ${BOLD}→${RESET} open  ${BOLD}←${RESET} back  ${BOLD}^o${RESET} finder  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy  ${BOLD}.${RESET} ${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
     }
     lines.push(padVisible(foot, cols));
 
@@ -371,9 +394,9 @@ export function runUI(rootPath: string): void {
       "←  h  bksp   go back",
       "g G  home end jump",
       "pgup pgdn     page",
-      "o            reveal in Finder",
-      "d            move to Trash",
-      "y            copy path",
+      "ctrl-o        reveal in Finder",
+      "ctrl-d        move to Trash",
+      "ctrl-y        copy path",
       ".            toggle hidden files",
       "/            filter this column",
       "?            this help",
@@ -428,18 +451,26 @@ export function runUI(rootPath: string): void {
     }
     if (state.busy) return;
 
-    if (state.filtering && kind === "char" && char !== "/") {
+    // While typing a filter every printable key is text. Acting on it would
+    // open or trash something the moment the query contained o, d or y.
+    if (state.filtering && kind === "char") {
       if (char >= " " && char !== "\x7f") state.query += char;
       return;
     }
 
     switch (kind) {
       case "up":
+        move(-1);
+        return;
       case "k":
+        if (state.filtering) return;
         move(-1);
         return;
       case "down":
+        move(1);
+        return;
       case "j":
+        if (state.filtering) return;
         move(1);
         return;
       case "pageup":
@@ -449,25 +480,37 @@ export function runUI(rootPath: string): void {
         move(rows - 5);
         return;
       case "home":
+        move(-1_000_000);
+        return;
       case "g":
+        if (state.filtering) return;
         move(-1_000_000);
         return;
       case "end":
+        move(1_000_000);
+        return;
       case "G":
+        if (state.filtering) return;
         move(1_000_000);
         return;
       case "right":
-      case "l":
       case "enter":
         enter();
         return;
+      case "l":
+        if (state.filtering) return;
+        enter();
+        return;
       case "left":
-      case "h":
       case "backspace":
         if (state.filtering && state.query) {
           state.query = state.query.slice(0, -1);
           return;
         }
+        back();
+        return;
+      case "h":
+        if (state.filtering) return;
         back();
         return;
       case "escape":
@@ -478,12 +521,19 @@ export function runUI(rootPath: string): void {
         state.filtering = true;
         return;
       case "quit":
+        if (state.filtering) {
+          state.query = "";
+          state.filtering = false;
+          return;
+        }
         shutdown();
         return;
       case "help":
+        if (state.filtering) return;
         state.help = true;
         return;
       case "hidden":
+        if (state.filtering) return;
         state.showHidden = !state.showHidden;
         state.cursor = null;
         return;
@@ -515,7 +565,7 @@ export function runUI(rootPath: string): void {
     try {
       await trash(path);
       const parent = target.parent;
-      const listBefore = ordered(parent, state.showHidden, Date.now(), true, true);
+      const listBefore = ordered(parent, state.showHidden);
       const index = listBefore.indexOf(target);
       detach(target);
       if (state.cursor === target) {
@@ -647,13 +697,17 @@ function readKey(text: string, index: number): Key {
   }
   if (char === "\r" || char === "\n") return { kind: "enter", char, length: 1 };
   if (char === "\x7f" || char === "\b") return { kind: "backspace", char, length: 1 };
-  if (char === "\x03" || char === "q") return { kind: "quit", char, length: 1 };
+  // ctrl-c always quits; the letter keys also answer to ctrl so they stay
+  // usable while a filter treats plain letters as text.
+  if (char === "\x03") return { kind: "quit", char, length: 1 };
+  if (char === "\x0f") return { kind: "open", char, length: 1 };
+  if (char === "\x04") return { kind: "delete", char, length: 1 };
+  if (char === "\x19") return { kind: "yank", char, length: 1 };
+  if (char === "\x11") return { kind: "quit", char, length: 1 };
+  if (char === "q") return { kind: "quit", char, length: 1 };
   if (char === "?") return { kind: "help", char, length: 1 };
   if (char === "/") return { kind: "filter", char, length: 1 };
   if (char === ".") return { kind: "hidden", char, length: 1 };
-  if (char === "o") return { kind: "open", char, length: 1 };
-  if (char === "d") return { kind: "delete", char, length: 1 };
-  if (char === "y") return { kind: "yank", char, length: 1 };
   if (char === "j" || char === "k" || char === "h" || char === "l" || char === "g" || char === "G") {
     return { kind: char, char, length: 1 };
   }

@@ -18,9 +18,9 @@ Keys
   ↑↓ j k       move
   → l enter    open directory
   ← h bksp     back
-  o            reveal in Finder
-  d            move to Trash
-  y            copy path
+  ctrl-o       reveal in Finder
+  ctrl-d       move to Trash
+  ctrl-y       copy path
   .            toggle hidden files
   /            filter the column
   ?            help

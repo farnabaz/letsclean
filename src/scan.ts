@@ -1,37 +1,78 @@
 import { availableParallelism } from "node:os";
+import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 /**
- * Sync directory scans run in worker threads so the UI thread never blocks on
- * lstat. Each worker reads one directory, then yields between batches so huge
- * folders stream into the view instead of arriving in one multi-second hitch.
+ * Directory reads run in worker threads so the UI never blocks. On macOS each
+ * worker uses getattrlistbulk (native/scan.cc): one syscall returns the name,
+ * type and allocated size of a whole batch, instead of readdir plus an lstat
+ * per file. Elsewhere, or if the addon is missing, it falls back to that.
  * Classic-worker source (eval) so we don't depend on TypeScript loader hooks.
  */
+const nativePath = fileURLToPath(new URL("../native/build/Release/scannative.node", import.meta.url));
+
 const WORKER_SOURCE = `
 const { parentPort } = require("node:worker_threads");
 const { readdirSync, lstatSync } = require("node:fs");
+const { createRequire } = require("node:module");
 
-const BATCH = 2000;
+let native = null;
+try {
+  native = createRequire(${JSON.stringify(nativePath)})(${JSON.stringify(nativePath)});
+} catch (err) {
+  native = null;
+}
+
+const BATCH = 4000;
+
+function finish(id, error) {
+  parentPort.postMessage({ id: id, done: true, error: error || undefined, names: [] });
+}
 
 parentPort.on("message", async (msg) => {
   const id = msg.id;
   const path = msg.path;
+  if (native) {
+    let handle;
+    try {
+      handle = native.open(path);
+    } catch (err) {
+      finish(id, (err && err.code) || "unreadable");
+      return;
+    }
+    try {
+      for (;;) {
+        const batch = native.read(handle);
+        if (batch.done) {
+          finish(id);
+          return;
+        }
+        const kinds = new Uint8Array(batch.kinds);
+        const sizes = new Float64Array(batch.sizes);
+        parentPort.postMessage(
+          { id: id, done: false, names: batch.names, kinds: kinds, sizes: sizes },
+          [kinds.buffer, sizes.buffer],
+        );
+      }
+    } catch (err) {
+      finish(id, (err && err.code) || "unreadable");
+    } finally {
+      try { native.close(handle); } catch (err) {}
+    }
+    return;
+  }
+
   let dirents;
   try {
     dirents = readdirSync(path, { withFileTypes: true });
   } catch (err) {
-    parentPort.postMessage({
-      id: id,
-      done: true,
-      error: (err && (err.code || err.message)) || "unreadable",
-      names: [],
-    });
+    finish(id, (err && err.code) || "unreadable");
     return;
   }
 
   const n = dirents.length;
   if (n === 0) {
-    parentPort.postMessage({ id: id, done: true, names: [] });
+    finish(id);
     return;
   }
 
@@ -111,7 +152,14 @@ export interface ScanStats {
   inFlight: number;
   queued: number;
   done: boolean;
+  /** Estimated bytes the tree itself occupies, files and directories combined. */
+  memory: number;
 }
+
+// Per entry, checked against process heap after a full scan of ~700k entries.
+// RSS runs higher still because of worker threads and allocator slack, so the
+// displayed figure is clamped up to the real resident size once a second.
+const BYTES_PER_ENTRY = 250;
 
 export interface Scanner {
   root: Entry;
@@ -220,10 +268,14 @@ export function fullPath(entry: Entry): string {
  */
 function addSize(entry: Entry, delta: number): void {
   entry.size += delta;
-  if (entry.parent) entry.parent.gen++;
+  // Bump every ancestor, not just the parent. A directory's size changes as
+  // its descendants are scanned, and any on-screen column showing that
+  // directory has to re-sort. Skipping the rest of the chain left the list in
+  // the order it first appeared until something else forced a sort.
   let current = entry.parent;
   while (current) {
     current.size += delta;
+    current.gen++;
     current = current.parent;
   }
 }
@@ -292,7 +344,12 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
     inFlight: 0,
     queued: 0,
     done: false,
+    memory: rootPath.length * 2 + BYTES_PER_ENTRY,
   };
+
+  function account(name: string): void {
+    stats.memory += name.length * 2 + BYTES_PER_ENTRY;
+  }
 
   const heap = new Heap();
   let seq = 0;
@@ -425,6 +482,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
         kids.push(child);
         addPending(entry, 1);
         stats.dirs++;
+        account(name);
         schedule(child);
         continue;
       }
@@ -451,6 +509,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
       kids.push(child);
       fileSum += size;
       stats.files++;
+      account(name);
     }
 
     if (fileSum !== 0) addSize(entry, fileSum);
