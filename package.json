@@ -1,0 +1,22 @@
+{
+  "name": "letsclean",
+  "version": "0.1.0",
+  "description": "OmniDiskSweeper-style terminal disk usage explorer",
+  "type": "module",
+  "bin": {
+    "letsclean": "dist/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
