@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
+import { trash } from "./trash.ts";
 import type { Entry, Scanner } from "./scan.ts";
 import { detach, fullPath, startScan } from "./scan.ts";
 import { fit, formatCount, formatRate, formatSize, padRight, sizeBar, visibleWidth } from "./format.ts";
@@ -103,25 +104,6 @@ function copyText(text: string): void {
   });
 }
 
-function trash(path: string): Promise<void> {
-  const os = platform();
-  return new Promise((resolve, reject) => {
-    if (os === "darwin") {
-      const escaped = path.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-      execFile(
-        "osascript",
-        ["-e", `tell application "Finder" to delete POSIX file "${escaped}"`],
-        (error) => (error ? reject(error) : resolve()),
-      );
-      return;
-    }
-    if (os === "linux") {
-      execFile("gio", ["trash", path], (error) => (error ? reject(error) : resolve()));
-      return;
-    }
-    reject(new Error("trash is not supported on this platform"));
-  });
-}
 
 export function runUI(rootPath: string): void {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
