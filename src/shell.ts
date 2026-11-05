@@ -1,9 +1,65 @@
 import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
-import { trash } from "./trash.ts";
-import type { Entry, Scanner } from "./scan.ts";
-import { detach, fullPath, startScan } from "./scan.ts";
-import { fit, formatCount, formatRate, formatSize, padRight, sizeBar, visibleWidth } from "./format.ts";
+import { lstatSync } from "node:fs";
+import { trash, trashMany } from "./trash.ts";
+import { fit, formatCount, formatSize, padRight, sizeBar, visibleWidth } from "./format.ts";
+
+/**
+ * The interactive terminal UI every tool shares: columns, cursor, filter,
+ * selection, help, confirmation and the trash / copy / reveal actions. A tool
+ * only provides a tree of nodes and a few hooks (see `Tool`).
+ */
+
+export type Kind = "dir" | "file" | "link";
+
+/** What the shell needs from a row. The disk scanner's `Entry` fits as is. */
+export interface Node {
+  name: string;
+  parent: Node | null;
+  kind: Kind;
+  /** Bytes, including descendants found so far. */
+  size: number;
+  /** Ordered by the shell; `null` while not listed yet. */
+  children: Node[] | null;
+  /** Work still outstanding in this subtree; shows a "…" while > 0. */
+  pending: number;
+  /** The directory itself is still being listed. */
+  listing?: boolean;
+  dead: boolean;
+  error?: string;
+  /** Bump whenever children or their sizes change so the column re-sorts. */
+  gen: number;
+}
+
+export interface ToolStats {
+  scanning: boolean;
+  /** Shown next to the spinner / timer, e.g. "1,234 files". */
+  info: string;
+  /** The headline size, e.g. "12 GB" or "3 GB reclaimable". */
+  total: string;
+}
+
+export interface Tool {
+  /** Shown in the header and the help box, e.g. "letsclean --nodejs". */
+  name: string;
+  root: Node;
+  /** Extra lines appended to the help box. */
+  help: string[];
+  /** Offer the `.` key to hide dotfiles. */
+  hiddenToggle?: boolean;
+  path(node: Node): string;
+  stats(now: number, cols: number): ToolStats;
+  /** Whether → opens this node as a new column. Defaults to directories. */
+  canOpen?(node: Node): boolean;
+  /** Called when a column becomes the active one. */
+  focus?(dir: Node): void;
+  /** Remove a node that was moved to Trash from the tree. */
+  detach(node: Node): void;
+  stop(): void;
+}
+
+/** A tool is built with a callback it calls whenever its data changes. */
+export type ToolFactory = (update: () => void) => Tool;
 
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -23,21 +79,20 @@ const HEADER = "\x1b[48;5;234m\x1b[97m";
 
 interface ColCache {
   gen: number;
-  at: number;
   hidden: boolean;
-  list: Entry[];
+  list: Node[];
 }
 
-const orderCache = new WeakMap<Entry, ColCache>();
+const orderCache = new WeakMap<Node, ColCache>();
 
-function ordered(entry: Entry, showHidden: boolean): Entry[] {
-  const kids = entry.children;
+function ordered(node: Node, showHidden: boolean): Node[] {
+  const kids = node.children;
   if (!kids) return [];
-  const cache = orderCache.get(entry);
-  if (cache && cache.hidden === showHidden && cache.gen === entry.gen) return cache.list;
+  const cache = orderCache.get(node);
+  if (cache && cache.hidden === showHidden && cache.gen === node.gen) return cache.list;
   const list = showHidden ? kids.slice() : kids.filter((child) => child.name.charCodeAt(0) !== 46);
   list.sort((a, b) => b.size - a.size || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  orderCache.set(entry, { gen: entry.gen, at: 0, hidden: showHidden, list });
+  orderCache.set(node, { gen: node.gen, hidden: showHidden, list });
   return list;
 }
 
@@ -48,20 +103,27 @@ function formatDuration(ms: number): string {
   return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
 }
 
-function matches(entry: Entry, query: string): boolean {
+function matches(node: Node, query: string): boolean {
   if (!query) return true;
-  return entry.name.toLowerCase().includes(query);
+  return node.name.toLowerCase().includes(query);
+}
+
+function sumSize(nodes: Node[]): number {
+  let total = 0;
+  for (const node of nodes) total += node.size;
+  return total;
 }
 
 interface UIState {
-  stack: Entry[];
-  cursor: Entry | null;
-  scroll: Map<Entry, number>;
+  stack: Node[];
+  cursor: Node | null;
+  scroll: Map<Node, number>;
   showHidden: boolean;
   query: string;
   filtering: boolean;
   help: boolean;
-  confirm: Entry | null;
+  marked: Set<Node>;
+  confirm: Node[] | null;
   message: string;
   messageUntil: number;
   busy: boolean;
@@ -74,6 +136,15 @@ function restoreTerminal(): void {
   restored = true;
   process.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l");
   if (process.stdin.isTTY) process.stdin.setRawMode(false);
+}
+
+function exists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function reveal(path: string): void {
@@ -104,8 +175,7 @@ function copyText(text: string): void {
   });
 }
 
-
-export function runUI(rootPath: string): void {
+export function runShell(create: ToolFactory): void {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error("letsclean needs an interactive terminal.");
     process.exitCode = 1;
@@ -116,7 +186,6 @@ export function runUI(rootPath: string): void {
   process.stdin.resume();
   process.stdout.write("\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J\x1b[H");
 
-  let scanner: Scanner | null = null;
   const state: UIState = {
     stack: [],
     cursor: null,
@@ -125,6 +194,7 @@ export function runUI(rootPath: string): void {
     query: "",
     filtering: false,
     help: false,
+    marked: new Set(),
     confirm: null,
     message: "",
     messageUntil: 0,
@@ -136,34 +206,74 @@ export function runUI(rootPath: string): void {
   let blocked = false;
   let renderScheduled = false;
   let lastRender = 0;
-  let lastFiles = 0;
-  let lastRateAt = Date.now();
-  let rate = 0;
   let stopped = false;
   const startedAt = Date.now();
   let finishedIn: number | null = null;
-  let rss = process.memoryUsage().rss;
-  let lastRssAt = 0;
+  let scanning = true;
+  // Assigned once the tool is built; it may report updates while constructing.
+  let tool!: Tool;
+
+  function canOpen(node: Node): boolean {
+    return tool.canOpen ? tool.canOpen(node) : node.kind === "dir";
+  }
 
   function note(text: string): void {
     state.message = text;
     state.messageUntil = Date.now() + 3500;
   }
 
-  function activeDir(): Entry | null {
+  function activeDir(): Node | null {
     return state.stack[state.stack.length - 1] ?? null;
   }
 
-  function activeList(force: boolean): Entry[] {
+  function activeList(): Node[] {
     const dir = activeDir();
     if (!dir) return [];
     const list = ordered(dir, state.showHidden);
     if (!state.query) return list;
     const query = state.query.toLowerCase();
-    return list.filter((entry) => matches(entry, query));
+    return list.filter((node) => matches(node, query));
   }
 
-  function ensureCursor(list: Entry[]): void {
+  /** Live marked nodes, minus any whose ancestor is also marked. */
+  function markedRoots(): Node[] {
+    const out: Node[] = [];
+    for (const node of state.marked) {
+      if (node.dead) {
+        state.marked.delete(node);
+        continue;
+      }
+      let ancestor = node.parent;
+      while (ancestor && !state.marked.has(ancestor)) ancestor = ancestor.parent;
+      if (!ancestor) out.push(node);
+    }
+    return out;
+  }
+
+  /** What batch actions apply to: the selection if any, else the cursor row. */
+  function targets(): Node[] {
+    const roots = markedRoots();
+    if (roots.length > 0) return roots;
+    return state.cursor ? [state.cursor] : [];
+  }
+
+  function toggleMark(): void {
+    const node = state.cursor;
+    if (!node || !node.parent) return;
+    if (state.marked.has(node)) state.marked.delete(node);
+    else state.marked.add(node);
+    move(1);
+  }
+
+  /** Select every row in the active column, or clear them if all are selected. */
+  function markAll(): void {
+    const list = activeList();
+    if (list.length === 0) return;
+    if (list.every((node) => state.marked.has(node))) for (const node of list) state.marked.delete(node);
+    else for (const node of list) state.marked.add(node);
+  }
+
+  function ensureCursor(list: Node[]): void {
     if (list.length === 0) {
       state.cursor = null;
       return;
@@ -172,7 +282,7 @@ export function runUI(rootPath: string): void {
   }
 
   function move(delta: number): void {
-    const list = activeList(true);
+    const list = activeList();
     ensureCursor(list);
     if (list.length === 0 || !state.cursor) return;
     const index = list.indexOf(state.cursor);
@@ -181,7 +291,7 @@ export function runUI(rootPath: string): void {
     followScroll(activeDir()!, list);
   }
 
-  function followScroll(dir: Entry, list: Entry[]): void {
+  function followScroll(dir: Node, list: Node[]): void {
     const listH = Math.max(1, rows - 4);
     let scroll = state.scroll.get(dir) ?? 0;
     const index = state.cursor ? list.indexOf(state.cursor) : 0;
@@ -194,16 +304,15 @@ export function runUI(rootPath: string): void {
 
   function enter(): void {
     const target = state.cursor;
-    if (!target || target.kind !== "dir") return;
+    if (!target || !canOpen(target)) return;
     state.stack.push(target);
     state.cursor = null;
     state.query = "";
     state.filtering = false;
-    scanner?.focus(target);
-    const list = activeList(true);
+    tool.focus?.(target);
+    const list = activeList();
     ensureCursor(list);
-    const dir = activeDir();
-    if (dir) followScroll(dir, list);
+    followScroll(target, list);
   }
 
   function back(): void {
@@ -214,8 +323,8 @@ export function runUI(rootPath: string): void {
     state.filtering = false;
     const dir = activeDir();
     if (dir) {
-      scanner?.focus(dir);
-      followScroll(dir, activeList(true));
+      tool.focus?.(dir);
+      followScroll(dir, activeList());
     }
   }
 
@@ -236,50 +345,28 @@ export function runUI(rootPath: string): void {
   }
 
   function draw(): void {
-    if (blocked || stopped) return;
+    if (blocked || stopped || state.stack.length === 0) return;
     lastRender = Date.now();
-    const now = lastRender;
-    if (scanner && !scanner.stats.done) {
-      if (now - lastRateAt >= 400) {
-        const files = scanner.stats.files;
-        rate = ((files - lastFiles) * 1000) / (now - lastRateAt);
-        lastFiles = files;
-        lastRateAt = now;
-      }
-    } else if (scanner && finishedIn === null) {
-      finishedIn = now - startedAt;
-    }
-    const frame = render(now);
+    const frame = render(lastRender);
     blocked = !process.stdout.write(frame);
   }
 
   function render(now: number): string {
     const lines: string[] = [];
-    const spin = scanner && !scanner.stats.done ? SPIN[Math.floor(now / 80) % SPIN.length] : " ";
-    const root = scanner?.root;
-    const total = root ? formatSize(root.size).trim() : "…";
-    const stats = scanner?.stats;
-    const scanning = stats && !stats.done;
-    if (now - lastRssAt > 1000) {
-      rss = process.memoryUsage().rss;
-      lastRssAt = now;
-    }
+    const stats = tool.stats(now, cols);
+    scanning = stats.scanning;
+    if (!scanning && finishedIn === null) finishedIn = now - startedAt;
+    const spin = SPIN[Math.floor(now / 80) % SPIN.length];
     const elapsed = formatDuration(finishedIn ?? now - startedAt);
-    const memory = formatSize(Math.max(stats?.memory ?? 0, rss)).trim();
-    const files = formatCount(stats?.files ?? 0);
-    const dirs = formatCount(stats?.dirs ?? 0);
-    const errors = stats && stats.errors > 0 ? `  ${formatCount(stats.errors)} skipped` : "";
-    const wide = cols >= 110;
-    const counts = wide ? `${files} files  ${dirs} dirs` : `${files} files`;
-    const status = scanning
-      ? `${spin} ${counts}  ${formatRate(rate)}  ${memory}  ${BOLD}${elapsed}${RESET}${HEADER}`
-      : `${BOLD}done in ${elapsed}${RESET}${HEADER}  ${counts}  ${memory}${errors}`;
+    const status = stats.scanning
+      ? `${spin} ${stats.info}  ${BOLD}${elapsed}${RESET}${HEADER}`
+      : `${BOLD}done in ${elapsed}${RESET}${HEADER}  ${stats.info}`;
     // Status is placed from the right edge so it stays visible as the terminal
     // narrows; the path takes whatever room is left.
-    const right = `  ${total}   ${status}${scanning ? errors : ""} `;
-    const pathWidth = Math.max(0, cols - visibleWidth(stripAnsi(right)) - 12);
-    const title = ` letsclean  ${fit(rootPath, pathWidth)}`;
-    lines.push(HEADER + padVisible(title, cols - visibleWidth(stripAnsi(right))) + right + RESET);
+    const right = `  ${stats.total}   ${status} `;
+    const rightW = visibleWidth(stripAnsi(right));
+    const title = ` ${tool.name}  ${fit(tool.path(tool.root), Math.max(0, cols - rightW - 12))}`;
+    lines.push(HEADER + padVisible(title, cols - rightW) + right + RESET);
 
     const listH = Math.max(1, rows - 4);
     const shown = visibleStack();
@@ -288,18 +375,18 @@ export function runUI(rootPath: string): void {
 
     const headerCells = shown.map((dir, index) => {
       const mark = dir.pending > 0 ? "…" : "";
-      const label = (dir.parent ? dir.name : dir.path) + mark;
+      const label = (dir.parent ? dir.name : tool.path(dir)) + mark;
       const size = formatSize(dir.size);
       const inner = widths[index]! - 1;
       const nameW = Math.max(1, inner - size.length - 1);
       return padRight(fit(label, nameW), nameW) + " " + size;
     });
-    lines.push(paintColumns(headerCells, widths, CYAN + BOLD, true) + RESET);
+    lines.push(paintColumns(headerCells, widths, CYAN + BOLD) + RESET);
 
     const lists = shown.map((dir, index) => {
       const isActive = index === shown.length - 1;
       const list = ordered(dir, state.showHidden);
-      if (isActive && state.query) return list.filter((entry) => matches(entry, state.query.toLowerCase()));
+      if (isActive && state.query) return list.filter((node) => matches(node, state.query.toLowerCase()));
       return list;
     });
 
@@ -312,53 +399,62 @@ export function runUI(rootPath: string): void {
       const cells: string[] = [];
       const styles: string[] = [];
       for (let c = 0; c < shown.length; c++) {
-        const dirEntry = shown[c]!;
+        const dirNode = shown[c]!;
         const list = lists[c]!;
-        const scroll = state.scroll.get(dirEntry) ?? 0;
-        const entry = list[scroll + row];
+        const scroll = state.scroll.get(dirNode) ?? 0;
+        const node = list[scroll + row];
         const isLast = c === shown.length - 1;
-        const opened = !isLast && shown[c + 1] === entry;
-        const selected = isLast && entry !== undefined && entry === state.cursor;
+        const opened = !isLast && shown[c + 1] === node;
+        const selected = isLast && node !== undefined && node === state.cursor;
+        const marked = node !== undefined && state.marked.has(node);
         const width = widths[c]!;
-        if (!entry) {
+        if (!node) {
           if (row === 0 && list.length === 0) {
-            const placeholder = dirEntry.error
-              ? RED + fit(dirEntry.error, width - 2)
-              : dirEntry.listing || dirEntry.children === null
+            const placeholder = dirNode.error
+              ? RED + fit(dirNode.error, width - 2)
+              : dirNode.listing || dirNode.children === null || (dirNode.children.length === 0 && dirNode.pending > 0)
                 ? DIM + " scanning…"
                 : DIM + " empty";
             cells.push(padVisible(placeholder, width - 1));
-            styles.push("");
           } else {
             cells.push(" ".repeat(Math.max(0, width - 1)));
-            styles.push("");
           }
+          styles.push("");
           continue;
         }
-        cells.push(paintEntry(entry, width - 1, list, selected));
+        const pending = node.pending > 0 || (node.children === null && canOpen(node));
+        cells.push(paintNode(node, width - 1, list, selected, marked, pending));
         styles.push(selected ? SELECT : opened ? OPEN : "");
       }
-      lines.push(paintColumns(cells, widths, "", false, styles));
+      lines.push(paintColumns(cells, widths, "", styles));
     }
 
-    const selected = state.cursor;
-    const detail = selected
-      ? `${selected.kind === "dir" ? "dir " : selected.kind === "link" ? "link" : "file"}  ${formatSize(selected.size).trim()}${selected.pending > 0 ? "  …" : ""}  ${fullPath(selected)}${selected.error ? "  " + selected.error : ""}`
-      : rootPath;
+    const current = state.cursor;
+    const detail = current
+      ? `${current.kind === "dir" ? "dir " : current.kind === "link" ? "link" : "file"}  ${formatSize(current.size).trim()}${current.pending > 0 ? "  …" : ""}  ${tool.path(current)}${current.error ? "  " + current.error : ""}`
+      : tool.path(tool.root);
     const filterLabel = state.query ? `  filter: ${state.query}${state.filtering ? "▍" : ""}` : "";
     const detailLine = fit(detail, Math.max(0, cols - visibleWidth(filterLabel) - 1)) + filterLabel;
     lines.push(DIM + padVisible(" " + detailLine, cols) + RESET);
 
+    const roots = state.marked.size > 0 ? markedRoots() : [];
     let foot: string;
     if (state.confirm) {
-      foot = `${YELLOW}${BOLD} Trash ${state.confirm.name}? ${RESET}${YELLOW} y confirm   n cancel${RESET}`;
+      const what =
+        state.confirm.length === 1
+          ? state.confirm[0]!.name
+          : `${formatCount(state.confirm.length)} items (${formatSize(sumSize(state.confirm)).trim()})`;
+      foot = `${YELLOW}${BOLD} Trash ${what}? ${RESET}${YELLOW} y confirm   n cancel${RESET}`;
     } else if (state.message && now < state.messageUntil) {
       foot = YELLOW + " " + state.message + RESET;
+    } else if (roots.length > 0) {
+      foot = `${YELLOW}${BOLD} ${formatCount(roots.length)} selected  ${formatSize(sumSize(roots)).trim()} ${RESET}  ${BOLD}space${RESET} toggle  ${BOLD}^a${RESET} all  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy  ${BOLD}esc${RESET} ${state.query ? "clear filter" : "deselect"}`;
     } else if (state.filtering) {
-      foot = `${BOLD}/${state.query}${RESET}  type to filter   ↑↓ move   ^o reveal   ^d trash   ^y copy   esc clear`;
+      foot = `${BOLD}/${state.query}${RESET}  type to filter   ↑↓ move   tab select   ^o reveal   ^d trash   ^y copy   esc clear`;
     } else {
-      const hidden = state.showHidden ? "shown" : "hidden";
-      foot = ` ${BOLD}↑↓${RESET} move  ${BOLD}→${RESET} open  ${BOLD}←${RESET} back  ${BOLD}^o${RESET} finder  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy  ${BOLD}.${RESET} ${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
+      const hidden = tool.hiddenToggle ? `  ${BOLD}.${RESET} ${state.showHidden ? "shown" : "hidden"}` : "";
+      const nav = state.stack.length > 1 || activeList().some(canOpen) ? `  ${BOLD}→${RESET} open  ${BOLD}←${RESET} back` : "";
+      foot = ` ${BOLD}↑↓${RESET} move${nav}  ${BOLD}space${RESET} select  ${BOLD}^o${RESET} finder  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
     }
     lines.push(padVisible(foot, cols));
 
@@ -369,24 +465,24 @@ export function runUI(rootPath: string): void {
 
   function renderHelp(): string {
     const body = [
-      "letsclean",
+      tool.name,
       "",
       "↑ ↓  j k     move",
       "→  l  enter  open directory",
       "←  h  bksp   go back",
       "g G  home end jump",
       "pgup pgdn     page",
+      "space  tab    select / deselect row",
+      "ctrl-a        select all in column",
+      "esc           clear filter, then selection",
       "ctrl-o        reveal in Finder",
-      "ctrl-d        move to Trash",
-      "ctrl-y        copy path",
-      ".            toggle hidden files",
+      "ctrl-d        move to Trash (selection)",
+      "ctrl-y        copy path (selection)",
+      ...(tool.hiddenToggle ? [".            toggle hidden files"] : []),
       "/            filter this column",
       "?            this help",
       "q  ctrl-c    quit",
-      "",
-      "Sizes are allocated disk usage and grow",
-      "while the scan is still running. The",
-      "folder you are looking at is scanned first.",
+      ...(tool.help.length > 0 ? ["", ...tool.help] : []),
       "",
       "any key closes",
     ];
@@ -403,7 +499,7 @@ export function runUI(rootPath: string): void {
     return out;
   }
 
-  function visibleStack(): Entry[] {
+  function visibleStack(): Node[] {
     if (state.stack.length === 0) return [];
     const minCol = 32;
     const maxCols = Math.max(1, Math.min(state.stack.length, Math.floor(cols / minCol)));
@@ -429,30 +525,28 @@ export function runUI(rootPath: string): void {
     if (state.confirm) {
       if (char === "y" || char === "Y") void confirmTrash();
       else if (char === "n" || char === "N" || kind === "escape" || char === "q") state.confirm = null;
+      else if (kind === "quit" && char === "\x03") shutdown();
       return;
     }
-    if (state.busy) return;
+    if (state.busy) {
+      if (kind === "quit" && char === "\x03") shutdown();
+      return;
+    }
 
-    // While typing a filter every printable key is text. Acting on it would
-    // open or trash something the moment the query contained o, d or y.
-    if (state.filtering && kind === "char") {
-      if (char >= " " && char !== "\x7f") state.query += char;
+    // While typing a filter every printable key is text, including the letter
+    // shortcuts. Ctrl keys, arrows, tab and esc still act.
+    if (state.filtering && char.length === 1 && char >= " " && char !== "\x7f") {
+      state.query += char;
       return;
     }
 
     switch (kind) {
       case "up":
-        move(-1);
-        return;
       case "k":
-        if (state.filtering) return;
         move(-1);
         return;
       case "down":
-        move(1);
-        return;
       case "j":
-        if (state.filtering) return;
         move(1);
         return;
       case "pageup":
@@ -462,25 +556,16 @@ export function runUI(rootPath: string): void {
         move(rows - 5);
         return;
       case "home":
-        move(-1_000_000);
-        return;
       case "g":
-        if (state.filtering) return;
         move(-1_000_000);
         return;
       case "end":
-        move(1_000_000);
-        return;
       case "G":
-        if (state.filtering) return;
         move(1_000_000);
         return;
       case "right":
       case "enter":
-        enter();
-        return;
       case "l":
-        if (state.filtering) return;
         enter();
         return;
       case "left":
@@ -492,72 +577,133 @@ export function runUI(rootPath: string): void {
         back();
         return;
       case "h":
-        if (state.filtering) return;
         back();
         return;
       case "escape":
-        state.query = "";
-        state.filtering = false;
+        if (state.query || state.filtering) {
+          state.query = "";
+          state.filtering = false;
+        } else {
+          state.marked.clear();
+        }
+        return;
+      case "toggle":
+        toggleMark();
+        return;
+      case "all":
+        markAll();
+        return;
+      case "char":
+        if (char === " ") toggleMark();
         return;
       case "filter":
         state.filtering = true;
         return;
       case "quit":
-        if (state.filtering) {
-          state.query = "";
-          state.filtering = false;
-          return;
-        }
         shutdown();
         return;
       case "help":
-        if (state.filtering) return;
         state.help = true;
         return;
       case "hidden":
-        if (state.filtering) return;
+        if (!tool.hiddenToggle) return;
         state.showHidden = !state.showHidden;
         state.cursor = null;
         return;
       case "open":
-        if (state.cursor) reveal(fullPath(state.cursor));
+        if (state.cursor) reveal(tool.path(state.cursor));
         return;
-      case "yank":
-        if (state.cursor) {
-          copyText(fullPath(state.cursor));
-          note("copied " + fullPath(state.cursor));
-        }
+      case "yank": {
+        const paths = targets().map((node) => tool.path(node));
+        if (paths.length === 0) return;
+        copyText(paths.join("\n"));
+        note(paths.length === 1 ? "copied " + paths[0] : `copied ${formatCount(paths.length)} paths`);
         return;
-      case "delete":
-        if (state.cursor && state.cursor.parent) state.confirm = state.cursor;
+      }
+      case "delete": {
+        const list = targets().filter((node) => node.parent);
+        if (list.length > 0) state.confirm = list;
         return;
+      }
       default:
         return;
     }
   }
 
   async function confirmTrash(): Promise<void> {
-    const target = state.confirm;
+    const list = state.confirm;
     state.confirm = null;
-    if (!target || !target.parent || state.busy) return;
+    if (!list || list.length === 0 || state.busy) return;
     state.busy = true;
-    const path = fullPath(target);
-    note("moving to Trash…");
-    scheduleRender(true);
+    const listBefore = activeList();
+    const cursorIndex = state.cursor ? listBefore.indexOf(state.cursor) : -1;
+    let done = 0;
+    let freed = 0;
+    let firstError = "";
+    const remove = (target: Node): void => {
+      const size = target.size;
+      tool.detach(target);
+      target.dead = true;
+      state.marked.delete(target);
+      freed += size;
+      done++;
+    };
     try {
-      await trash(path);
-      const parent = target.parent;
-      const listBefore = ordered(parent, state.showHidden);
-      const index = listBefore.indexOf(target);
-      detach(target);
-      if (state.cursor === target) {
-        const list = activeList(true);
-        state.cursor = list[index] ?? list[index - 1] ?? list[0] ?? null;
+      const live = list.filter((target) => !target.dead && target.parent);
+      note(live.length === 1 ? "moving to Trash…" : `moving ${formatCount(live.length)} items to Trash…`);
+      scheduleRender(true);
+      try {
+        // One call for the whole batch, so Finder plays its sound once.
+        await trashMany(live.map((target) => tool.path(target)));
+        for (const target of live) remove(target);
+      } catch {
+        // Retry one by one to find which items failed. A partly applied batch
+        // leaves some paths already gone; those count as trashed.
+        for (let i = 0; i < live.length; i++) {
+          const target = live[i]!;
+          const path = tool.path(target);
+          if (!exists(path)) {
+            remove(target);
+            continue;
+          }
+          note(`moving to Trash… ${i + 1}/${live.length}`);
+          scheduleRender(true);
+          try {
+            await trash(path);
+            remove(target);
+          } catch (error) {
+            const message = (error instanceof Error ? error.message : "trash failed").replaceAll("\n", " ").slice(0, 120);
+            target.error = message;
+            if (!firstError) firstError = message;
+          }
+        }
       }
-      note("trashed " + target.name);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "trash failed";
-      note(message.replaceAll("\n", " ").slice(0, 120));
+      for (const node of state.marked) if (node.dead) state.marked.delete(node);
+
+      // A trashed directory may be open in the column stack.
+      let popped = false;
+      while (state.stack.length > 1 && state.stack.some((dir) => dir.dead)) {
+        back();
+        popped = true;
+      }
+      if (popped) {
+        if (state.cursor?.dead) state.cursor = null;
+      } else if (state.cursor?.dead) {
+        let next: Node | null = null;
+        for (let i = cursorIndex; i >= 0 && i < listBefore.length && !next; i++) {
+          if (!listBefore[i]!.dead) next = listBefore[i]!;
+        }
+        for (let i = cursorIndex - 1; i >= 0 && !next; i--) {
+          if (!listBefore[i]!.dead) next = listBefore[i]!;
+        }
+        state.cursor = next;
+      }
+
+      const failed = list.length - done;
+      if (list.length === 1 && done === 1) note("trashed " + list[0]!.name);
+      else if (failed === 0) note(`trashed ${formatCount(done)} items, freed ${formatSize(freed).trim()}`);
+      else if (done === 0) note(firstError);
+      else note(`trashed ${formatCount(done)}, ${formatCount(failed)} failed: ${firstError}`);
     } finally {
       state.busy = false;
       scheduleRender(true);
@@ -567,7 +713,7 @@ export function runUI(rootPath: string): void {
   function shutdown(): void {
     if (stopped) return;
     stopped = true;
-    scanner?.stop();
+    tool?.stop();
     restoreTerminal();
     process.exit(0);
   }
@@ -586,24 +732,44 @@ export function runUI(rootPath: string): void {
   });
   process.stdin.on("data", onData);
 
-  scanner = startScan(rootPath, () => scheduleRender(false));
-  state.stack = [scanner.root];
-  scanner.focus(scanner.root);
+  const built = create(() => scheduleRender(false));
+  state.stack = [built.root];
+  tool = built;
+  built.focus?.(built.root);
   scheduleRender(true);
+  // Keep the spinner and timer moving even when the tool is quiet.
+  setInterval(() => {
+    if (scanning) scheduleRender(false);
+  }, 250).unref();
 }
 
-function paintEntry(entry: Entry, width: number, siblings: Entry[], selected: boolean): string {
-  const size = formatSize(entry.size);
-  const pending = entry.kind === "dir" && (entry.pending > 0 || entry.children === null) ? "…" : "";
-  const suffix = entry.kind === "dir" ? "/" : entry.kind === "link" ? "@" : "";
+function paintNode(node: Node, width: number, siblings: Node[], selected: boolean, marked: boolean, isPending: boolean): string {
+  // Reset only bold/foreground so a row background (OPEN) survives the marker.
+  const gutter = marked ? (selected ? "●" : YELLOW + BOLD + "●" + "\x1b[22;39m") : " ";
+  width -= 1;
+  const size = formatSize(node.size);
+  const pending = isPending ? "…" : "";
+  const suffix = node.kind === "dir" ? "/" : node.kind === "link" ? "@" : "";
   const barW = width >= 36 ? 8 : 0;
   const nameW = width - size.length - 1 - (barW > 0 ? barW + 1 : 0) - pending.length;
   const max = siblings[0]?.size ?? 0;
-  const nameColor = selected ? "" : entry.kind === "dir" ? CYAN : entry.kind === "link" ? MAGENTA : "";
+  const nameColor = selected
+    ? marked
+      ? BOLD
+      : ""
+    : marked
+      ? YELLOW + BOLD
+      : node.kind === "dir"
+        ? CYAN
+        : node.kind === "link"
+          ? MAGENTA
+          : "";
   const sizeColor = selected ? "" : GREEN;
-  const name = fit(entry.name + suffix, Math.max(1, nameW));
-  const bar = barW > 0 ? sizeBar(entry.size, max, barW) : "";
+  const name = fit(node.name + suffix, Math.max(1, nameW));
+  const bar = barW > 0 ? sizeBar(node.size, max, barW) : "";
   const core =
+    gutter +
+    (selected ? SELECT : "") +
     sizeColor +
     size +
     RESET +
@@ -617,18 +783,15 @@ function paintEntry(entry: Entry, width: number, siblings: Entry[], selected: bo
     (selected ? "" : RESET) +
     (selected ? SELECT : YELLOW) +
     pending;
-  return padVisible(core, width);
+  return padVisible(core, width + 1);
 }
 
-function paintColumns(cells: string[], widths: number[], style: string, header: boolean, styles?: string[]): string {
+function paintColumns(cells: string[], widths: number[], style: string, styles?: string[]): string {
   let out = "";
   for (let i = 0; i < cells.length; i++) {
     const bg = styles?.[i] ?? "";
     const sep = i === cells.length - 1 ? "" : DIM + "│" + RESET;
     out += bg + style + cells[i] + RESET + sep;
-    if (header) {
-      // style already applied by caller via ANSI inside the padded cell
-    }
   }
   return out;
 }
@@ -666,22 +829,24 @@ function readKey(text: string, index: number): Key {
     if (rest.startsWith("\x1b[F") || rest.startsWith("\x1b[4~") || rest.startsWith("\x1bOF")) {
       return { kind: "end", char: "", length: rest.startsWith("\x1b[4~") ? 4 : 3 };
     }
-    if (rest === "\x1b" || rest.startsWith("\x1b") && rest.length === 1) return { kind: "escape", char: "", length: 1 };
+    if (rest.length === 1) return { kind: "escape", char: "", length: 1 };
     // Swallow incomplete or unknown escape sequences up to a letter or tilde.
     let length = 1;
     while (length < rest.length && length < 8) {
       const code = rest.charCodeAt(length);
       length++;
-      if ((code >= 64 && code <= 126) || code === 126) break;
+      if (code >= 64 && code <= 126) break;
     }
     if (length === 1) return { kind: "escape", char: "", length: 1 };
     return { kind: "ignore", char: "", length };
   }
   if (char === "\r" || char === "\n") return { kind: "enter", char, length: 1 };
+  if (char === "\t") return { kind: "toggle", char, length: 1 };
   if (char === "\x7f" || char === "\b") return { kind: "backspace", char, length: 1 };
   // ctrl-c always quits; the letter keys also answer to ctrl so they stay
   // usable while a filter treats plain letters as text.
   if (char === "\x03") return { kind: "quit", char, length: 1 };
+  if (char === "\x01") return { kind: "all", char, length: 1 };
   if (char === "\x0f") return { kind: "open", char, length: 1 };
   if (char === "\x04") return { kind: "delete", char, length: 1 };
   if (char === "\x19") return { kind: "yank", char, length: 1 };
@@ -693,6 +858,5 @@ function readKey(text: string, index: number): Key {
   if (char === "j" || char === "k" || char === "h" || char === "l" || char === "g" || char === "G") {
     return { kind: char, char, length: 1 };
   }
-  if (char === "\x1b") return { kind: "escape", char, length: 1 };
   return { kind: "char", char, length: 1 };
 }

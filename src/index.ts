@@ -2,8 +2,9 @@
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { runNodeClean } from "./node-clean.ts";
-import { runUI } from "./ui.ts";
+import { diskTool } from "./disk.ts";
+import { nodeCleanTool } from "./node-clean.ts";
+import { runShell } from "./shell.ts";
 
 const args = process.argv.slice(2);
 const nodejs = args.includes("--nodejs");
@@ -23,9 +24,12 @@ Keys
   ↑↓ j k       move
   → l enter    open directory
   ← h bksp     back
+  space tab    select / deselect row
+  ctrl-a       select all in column
+  esc          clear filter, then selection
   ctrl-o       reveal in Finder
-  ctrl-d       move to Trash
-  ctrl-y       copy path
+  ctrl-d       move to Trash (selection)
+  ctrl-y       copy path (selection)
   .            toggle hidden files
   /            filter the column
   ?            help
@@ -47,5 +51,4 @@ try {
   process.exit(1);
 }
 
-if (nodejs) void runNodeClean(root);
-else runUI(root);
+runShell(nodejs ? nodeCleanTool(root) : diskTool(root));
