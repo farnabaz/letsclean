@@ -34,6 +34,7 @@
     "build": "tsc",
     "rebuild": "node-gyp rebuild --directory native",
     "typecheck": "tsc --noEmit",
+    "release": "release-it",
     "prepublishOnly": "npm run build"
   },
   "engines": {
@@ -41,7 +42,9 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "changelogithub": "^15.0.5",
     "node-gyp": "^13.1.0",
+    "release-it": "^21.1.2",
     "typescript": "^5.9.0"
   }
 }
