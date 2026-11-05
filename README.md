@@ -1,10 +1,22 @@
 # letsclean
 
+[![npm version](https://img.shields.io/npm/v/letsclean?color=black)](https://npmx.dev/letsclean)
+[![npm downloads](https://img.shields.io/npm/dm/letsclean?color=black)](https://npmx.dev/package-stats/letsclean/v/latest?granularity=monthly)
+[![license](https://img.shields.io/github/license/farnabaz/letsclean?color=black)](https://github.com/farnabaz/letsclean/blob/main/LICENSE)
+
 OmniDiskSweeper-style disk explorer for the terminal. Sizes stream in while you navigate, so you can start deleting before the scan finishes.
 
 Directory reads use `readdir` plus `lstat`. On macOS, a local native addon (`getattrlistbulk`: name, type, and allocated size in one syscall per batch) is used automatically if you have built it.
 
 ## Install
+
+Run it without installing:
+
+```sh
+npx letsclean
+```
+
+Or install it globally:
 
 ```sh
 npm install -g letsclean
@@ -59,3 +71,4 @@ The published package is JS only. To use the faster macOS scanner locally (needs
 ```sh
 npm run rebuild
 ```
+
