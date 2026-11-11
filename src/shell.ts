@@ -61,6 +61,9 @@ export interface Tool {
 /** A tool is built with a callback it calls whenever its data changes. */
 export type ToolFactory = (update: () => void) => Tool;
 
+/** Narrowest a parent column may get before older columns are dropped. */
+const MIN_PARENT_COL = 24;
+
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 const RESET = "\x1b[0m";
@@ -370,8 +373,7 @@ export function runShell(create: ToolFactory): void {
 
     const listH = Math.max(1, rows - 4);
     const shown = visibleStack();
-    const colW = Math.max(1, Math.floor(cols / shown.length));
-    const widths = shown.map((_, index) => (index === shown.length - 1 ? cols - colW * (shown.length - 1) : colW));
+    const widths = columnWidths(shown.length);
 
     const headerCells = shown.map((dir, index) => {
       const mark = dir.pending > 0 ? "…" : "";
@@ -499,11 +501,29 @@ export function runShell(create: ToolFactory): void {
     return out;
   }
 
+  /**
+   * The active column always gets at least half the screen; parent columns
+   * share the other half, and the oldest fall off the left when they'd get
+   * narrower than MIN_PARENT_COL.
+   */
   function visibleStack(): Node[] {
     if (state.stack.length === 0) return [];
-    const minCol = 32;
-    const maxCols = Math.max(1, Math.min(state.stack.length, Math.floor(cols / minCol)));
-    return state.stack.slice(state.stack.length - maxCols);
+    const parentRoom = Math.floor(cols / 2);
+    const maxParents = Math.floor(parentRoom / MIN_PARENT_COL);
+    const count = Math.max(1, Math.min(state.stack.length, maxParents + 1));
+    return state.stack.slice(state.stack.length - count);
+  }
+
+  function columnWidths(count: number): number[] {
+    if (count <= 1) return [cols];
+    const parentRoom = Math.floor(cols / 2);
+    const parents = count - 1;
+    const each = Math.max(1, Math.floor(parentRoom / parents));
+    const widths = new Array<number>(parents).fill(each);
+    // Leftover cells from the parent split go to the nearest parent column.
+    widths[parents - 1]! += Math.max(0, parentRoom - each * parents);
+    widths.push(cols - parentRoom);
+    return widths;
   }
 
   function onData(chunk: Buffer): void {
