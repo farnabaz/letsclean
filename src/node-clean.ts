@@ -1,6 +1,7 @@
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import { firmlinkShadows } from "./firmlinks.ts";
 import { formatCount, formatSize } from "./format.ts";
 import type { Node, ToolFactory } from "./shell.ts";
 
@@ -150,6 +151,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
       gen: 0,
     };
 
+    const shadows = firmlinkShadows(rootPath);
     let queued = 1;
     let running = 0;
     let found = 0;
@@ -234,8 +236,11 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
           sizeQueue.push(item);
         }
         for (const name of result.descend ?? []) {
+          const path = dir === "/" ? "/" + name : dir + "/" + name;
+          // Firmlink twin of a path already being walked; would list every hit twice.
+          if (shadows.has(path)) continue;
           queued++;
-          void walk(dir === "/" ? "/" + name : dir + "/" + name);
+          void walk(path);
         }
       }
       if (running === 0 && queued === 0) {

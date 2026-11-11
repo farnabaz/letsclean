@@ -1,6 +1,7 @@
 import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import { firmlinkShadows } from "./firmlinks.ts";
 
 /**
  * Directory reads run in worker threads so the UI never blocks. On macOS each
@@ -351,6 +352,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
     stats.memory += name.length * 2 + BYTES_PER_ENTRY;
   }
 
+  const shadows = firmlinkShadows(rootPath);
   const heap = new Heap();
   let seq = 0;
   let nextId = 1;
@@ -464,9 +466,14 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
       const name = names[i]!;
 
       if (isDir) {
+        const childPath = joinPath(entry.path, name);
+        // Same directory as a firmlink already in the tree; counting it here too
+        // would double the size. Leaving it out also keeps it from being trashed
+        // under its second name.
+        if (shadows.has(childPath)) continue;
         const child: Entry = {
           name,
-          path: joinPath(entry.path, name),
+          path: childPath,
           parent: entry,
           kind: "dir",
           size: 0,
