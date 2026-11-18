@@ -379,7 +379,7 @@ export function runShell(create: ToolFactory): void {
     listTrash()
       .then(async (paths) => {
         if (closed()) return;
-        dialog.items = paths.map((path) => ({ path, size: 0, done: false }));
+        dialog.items = paths.map(({ path, volume }) => ({ path, volume, size: 0, done: false }));
         dialog.sizing = true;
         scheduleRender(true);
         await sizePaths(dialog.items, () => scheduleRender(false), closed);
@@ -642,7 +642,8 @@ export function runShell(create: ToolFactory): void {
       dialog.scroll = Math.max(0, Math.min(dialog.scroll, sorted.length - listH));
       for (const item of sorted.slice(dialog.scroll, dialog.scroll + listH)) {
         const name = basename(item.path) + (item.done ? "" : " …");
-        body.push(` ${GREEN}${formatSize(item.size)}${RESET}  ${fit(name, inner - 12)}`);
+        const drive = item.volume ? fit(" · " + item.volume, Math.floor((inner - 12) / 3)) : "";
+        body.push(` ${GREEN}${formatSize(item.size)}${RESET}  ${fit(name, inner - 12 - visibleWidth(drive))}${DIM}${drive}${RESET}`);
       }
       const above = dialog.scroll;
       const below = sorted.length - dialog.scroll - listH;

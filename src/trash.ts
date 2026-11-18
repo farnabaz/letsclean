@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Paths arrive as argv, so nothing needs escaping. Build the list outside the
@@ -66,13 +66,64 @@ function output(command: string, args: string[]): Promise<string> {
   });
 }
 
-function linuxTrashDir(): string {
-  const data = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-  return join(data, "Trash", "files");
+export interface TrashEntry {
+  path: string;
+  /** Name of the drive the item sits on; "" for the home Trash. */
+  volume: string;
 }
 
-/** Absolute paths of the items at the top level of the Trash. */
-export async function listTrash(): Promise<string[]> {
+async function readTrashDir(dir: string, volume: string): Promise<TrashEntry[]> {
+  try {
+    return (await readdir(dir)).map((name) => ({ path: join(dir, name), volume }));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR" || code === "EACCES" || code === "EPERM") return [];
+    throw error;
+  }
+}
+
+// Pseudo and image filesystems never hold a user Trash.
+const SKIP_FS = new Set(["squashfs", "tmpfs", "devtmpfs", "overlay", "proc", "sysfs", "ramfs"]);
+
+/** Real block-device mounts, from /proc/self/mounts. */
+async function linuxMounts(): Promise<string[]> {
+  let text: string;
+  try {
+    text = await readFile("/proc/self/mounts", "utf8");
+  } catch {
+    return [];
+  }
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    const [device, mount, type] = line.split(" ");
+    if (!device || !mount || !type || !device.startsWith("/dev/") || SKIP_FS.has(type)) continue;
+    // Spaces and friends are octal-escaped, e.g. "\040".
+    out.add(mount.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8))));
+  }
+  return [...out];
+}
+
+/**
+ * Linux keeps one Trash in the home folder and one per drive, at
+ * $mount/.Trash/$uid or $mount/.Trash-$uid (freedesktop.org Trash spec).
+ */
+async function linuxTrash(): Promise<TrashEntry[]> {
+  const data = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  const home = join(data, "Trash", "files");
+  const uid = process.getuid?.() ?? 0;
+  const dirs = new Map<string, string>([[home, ""]]);
+  for (const mount of await linuxMounts()) {
+    const volume = mount === "/" ? "/" : basename(mount);
+    for (const dir of [join(mount, ".Trash", String(uid), "files"), join(mount, `.Trash-${uid}`, "files")]) {
+      if (!dirs.has(dir)) dirs.set(dir, volume);
+    }
+  }
+  const found = await Promise.all([...dirs].map(([dir, volume]) => readTrashDir(dir, volume)));
+  return found.flat();
+}
+
+/** The items at the top level of every mounted drive's Trash. */
+export async function listTrash(): Promise<TrashEntry[]> {
   const os = platform();
   if (os === "darwin") {
     const text = await output("osascript", ["-e", MAC_LIST]);
@@ -80,17 +131,13 @@ export async function listTrash(): Promise<string[]> {
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => line.startsWith("file://"))
-      .map((url) => fileURLToPath(url).replace(/\/$/, "") || "/");
+      .map((url) => {
+        const path = fileURLToPath(url).replace(/\/$/, "") || "/";
+        // Other drives keep theirs at /Volumes/<drive>/.Trashes/<uid>.
+        return { path, volume: path.match(/^\/Volumes\/([^/]+)\//)?.[1] ?? "" };
+      });
   }
-  if (os === "linux") {
-    const dir = linuxTrashDir();
-    try {
-      return (await readdir(dir)).map((name) => join(dir, name));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
-    }
-  }
+  if (os === "linux") return linuxTrash();
   throw new Error("Trash is not supported on this platform");
 }
 
@@ -104,6 +151,8 @@ export async function emptyTrash(): Promise<void> {
 
 export interface SizedPath {
   path: string;
+  /** Drive label to show next to the name; "" for the home Trash. */
+  volume?: string;
   /** Allocated bytes found so far. */
   size: number;
   done: boolean;
