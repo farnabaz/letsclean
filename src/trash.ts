@@ -1,5 +1,8 @@
 import { execFile } from "node:child_process";
-import { platform } from "node:os";
+import { lstat, readdir } from "node:fs/promises";
+import { homedir, platform } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Paths arrive as argv, so nothing needs escaping. Build the list outside the
 // Finder block: `POSIX file` inside it resolves against Finder's terminology.
@@ -44,4 +47,112 @@ export async function trashMany(paths: string[]): Promise<void> {
 /** Move a path to the system Trash. Never unlinks it directly. */
 export function trash(path: string): Promise<void> {
   return trashMany([path]);
+}
+
+// Terminals usually can't list ~/.Trash (macOS privacy protection), but Finder
+// can, and the items inside can still be stat'ed. This also covers the per
+// volume .Trashes folders.
+const MAC_LIST = `tell application "Finder" to set found to URL of every item of trash
+set AppleScript's text item delimiters to linefeed
+return found as text`;
+
+function output(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (!error) return resolve(String(stdout));
+      const detail = String(stderr).trim().replace(/^.*execution error: /s, "");
+      reject(new Error(detail || error.message));
+    });
+  });
+}
+
+function linuxTrashDir(): string {
+  const data = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+  return join(data, "Trash", "files");
+}
+
+/** Absolute paths of the items at the top level of the Trash. */
+export async function listTrash(): Promise<string[]> {
+  const os = platform();
+  if (os === "darwin") {
+    const text = await output("osascript", ["-e", MAC_LIST]);
+    return text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("file://"))
+      .map((url) => fileURLToPath(url).replace(/\/$/, "") || "/");
+  }
+  if (os === "linux") {
+    const dir = linuxTrashDir();
+    try {
+      return (await readdir(dir)).map((name) => join(dir, name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
+  }
+  throw new Error("Trash is not supported on this platform");
+}
+
+/** Permanently delete everything in the Trash, the way Finder does. */
+export async function emptyTrash(): Promise<void> {
+  const os = platform();
+  if (os === "darwin") await run("osascript", ["-e", 'tell application "Finder" to empty trash']);
+  else if (os === "linux") await run("gio", ["trash", "--empty"]);
+  else throw new Error("Trash is not supported on this platform");
+}
+
+export interface SizedPath {
+  path: string;
+  /** Allocated bytes found so far. */
+  size: number;
+  done: boolean;
+}
+
+/**
+ * Add up allocated sizes under each path, a few directories at a time. Calls
+ * `progress` as sizes grow; stops early once `cancelled` returns true.
+ */
+export async function sizePaths(items: SizedPath[], progress: () => void, cancelled: () => boolean): Promise<void> {
+  const queue: { path: string; item: SizedPath }[] = items.map((item) => ({ path: item.path, item }));
+  const open = new Map<SizedPath, number>(items.map((item) => [item, 1]));
+  let lastProgress = 0;
+  const settle = (item: SizedPath): void => {
+    const left = open.get(item)! - 1;
+    open.set(item, left);
+    if (left === 0) item.done = true;
+  };
+  let active = 0;
+  const worker = async (): Promise<void> => {
+    while (!cancelled()) {
+      const job = queue.pop();
+      if (!job) {
+        if (active === 0) return;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        continue;
+      }
+      active++;
+      try {
+        const stat = await lstat(job.path);
+        job.item.size += stat.blocks > 0 ? stat.blocks * 512 : stat.size;
+        if (stat.isDirectory()) {
+          const names = await readdir(job.path).catch(() => [] as string[]);
+          open.set(job.item, open.get(job.item)! + names.length);
+          for (const name of names) queue.push({ path: job.path + "/" + name, item: job.item });
+        }
+      } catch {
+        // Unreadable entries just don't count.
+      } finally {
+        active--;
+        settle(job.item);
+      }
+      const now = Date.now();
+      if (now - lastProgress > 100) {
+        lastProgress = now;
+        progress();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 16 }, worker));
+  progress();
 }

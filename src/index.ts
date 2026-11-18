@@ -30,6 +30,7 @@ Keys
   ctrl-o       reveal in Finder
   ctrl-d       move to Trash (selection)
   ctrl-y       copy path (selection)
+  ctrl-k       commands (empty Trash, free space)
   .            toggle hidden files
   /            filter the column
   ?            help
