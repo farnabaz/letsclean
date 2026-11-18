@@ -26,6 +26,10 @@ try {
 
 const BATCH = 4000;
 
+function devOf(path) {
+  try { return lstatSync(path).dev; } catch (err) { return 0; }
+}
+
 function finish(id, error) {
   parentPort.postMessage({ id: id, done: true, error: error || undefined, names: [] });
 }
@@ -41,6 +45,7 @@ parentPort.on("message", async (msg) => {
       finish(id, (err && err.code) || "unreadable");
       return;
     }
+    let dev = -1;
     try {
       for (;;) {
         const batch = native.read(handle);
@@ -50,9 +55,12 @@ parentPort.on("message", async (msg) => {
         }
         const kinds = new Uint8Array(batch.kinds);
         const sizes = new Float64Array(batch.sizes);
+        // An addon built before inode reporting has no inos; links then count every time.
+        const inos = batch.inos ? new BigUint64Array(batch.inos) : new BigUint64Array(kinds.length);
+        if (dev < 0 && inos.some((ino) => ino !== 0n)) dev = devOf(path);
         parentPort.postMessage(
-          { id: id, done: false, names: batch.names, kinds: kinds, sizes: sizes },
-          [kinds.buffer, sizes.buffer],
+          { id: id, done: false, names: batch.names, kinds: kinds, sizes: sizes, inos: inos, dev: dev },
+          [kinds.buffer, sizes.buffer, inos.buffer],
         );
       }
     } catch (err) {
@@ -83,6 +91,8 @@ parentPort.on("message", async (msg) => {
     const names = new Array(count);
     const kinds = new Uint8Array(count);
     const sizes = new Float64Array(count);
+    const inos = new BigUint64Array(count);
+    let dev = 0;
     for (let i = 0; i < count; i++) {
       const d = dirents[start + i];
       const name = d.name;
@@ -103,13 +113,18 @@ parentPort.on("message", async (msg) => {
       try {
         const st = lstatSync(path === "/" ? "/" + name : path + "/" + name);
         sizes[i] = st.blocks > 0 ? st.blocks * 512 : st.size;
+        if (st.nlink > 1 && st.isFile()) {
+          // A plain stat rounds inodes above 2^53, which then collide.
+          inos[i] = lstatSync(path === "/" ? "/" + name : path + "/" + name, { bigint: true }).ino;
+          dev = st.dev;
+        }
       } catch (err) {
         kinds[i] = 8;
       }
     }
     const done = end === n;
-    const transfer = [kinds.buffer, sizes.buffer];
-    parentPort.postMessage({ id: id, done: done, names: names, kinds: kinds, sizes: sizes }, transfer);
+    const transfer = [kinds.buffer, sizes.buffer, inos.buffer];
+    parentPort.postMessage({ id: id, done: done, names: names, kinds: kinds, sizes: sizes, inos: inos, dev: dev }, transfer);
     if (!done) await new Promise((resolve) => setImmediate(resolve));
   }
 });
@@ -176,6 +191,26 @@ interface WorkerResult {
   names: string[];
   kinds?: Uint8Array;
   sizes?: Float64Array;
+  /** Inode of each file with more than one hard link; 0 otherwise. */
+  inos?: BigUint64Array;
+  /** Device the listed directory is on, for the inodes above. */
+  dev?: number;
+}
+
+/**
+ * Remembers hard-linked files already counted, the way du does: the first
+ * path seen for an inode carries its size and every other link counts as 0.
+ * Returns true the first time a (device, inode) pair is seen.
+ */
+export function hardLinks(): (dev: number, ino: bigint) => boolean {
+  const seen = new Map<number, Set<bigint>>();
+  return (dev, ino) => {
+    let inodes = seen.get(dev);
+    if (!inodes) seen.set(dev, (inodes = new Set()));
+    if (inodes.has(ino)) return false;
+    inodes.add(ino);
+    return true;
+  };
 }
 
 class Heap {
@@ -353,6 +388,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
   }
 
   const shadows = firmlinkShadows(rootPath);
+  const firstLink = hardLinks();
   const heap = new Heap();
   let seq = 0;
   let nextId = 1;
@@ -454,6 +490,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
     const names = msg.names;
     const kinds = msg.kinds;
     const sizes = msg.sizes;
+    const inos = msg.inos;
     let fileSum = 0;
     const kids = entry.children;
 
@@ -462,7 +499,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
       const isLink = (kindByte & 2) !== 0;
       const isDir = (kindByte & 1) !== 0;
       const failed = (kindByte & 8) !== 0;
-      const size = sizes ? sizes[i]! : 0;
+      let size = sizes ? sizes[i]! : 0;
       const name = names[i]!;
 
       if (isDir) {
@@ -493,6 +530,10 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
         schedule(child);
         continue;
       }
+
+      // Another link to this file was already counted.
+      const ino = inos ? inos[i]! : 0n;
+      if (ino !== 0n && !firstLink(msg.dev ?? 0, ino)) size = 0;
 
       const child: Entry = {
         name,
