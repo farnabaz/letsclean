@@ -56,6 +56,10 @@ async function macMounts(): Promise<{ name: string; mount: string }[]> {
   return [{ name: rootName, mount: "/" }, ...others];
 }
 
+function isBootMount(mount: string): boolean {
+  return mount === "/boot" || mount.startsWith("/boot/") || mount === "/efi";
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
   return Promise.race([promise, new Promise<null>((resolve) => setTimeout(resolve, ms))]);
 }
@@ -66,7 +70,10 @@ export async function listVolumes(path: string): Promise<VolumeSpace[]> {
   const mounts =
     os === "darwin"
       ? await macMounts()
-      : (await linuxMounts()).map((mount) => ({ name: mount === "/" ? "/" : basename(mount), mount }));
+      : (await linuxMounts())
+          // Boot and EFI partitions are small, fixed and not for files.
+          .filter((mount) => !isBootMount(mount))
+          .map((mount) => ({ name: mount === "/" ? "/" : basename(mount), mount }));
   if (mounts.length === 0) mounts.push({ name: path, mount: path });
 
   const here = await realpath(path).catch(() => path);

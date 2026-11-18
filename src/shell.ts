@@ -679,6 +679,10 @@ export function runShell(create: ToolFactory): void {
       // Each drive takes three lines; keep the box on screen.
       const fitCount = Math.max(1, Math.floor((rows - 8) / 3));
       dialog.scroll = Math.max(0, Math.min(dialog.scroll, drives.length - fitCount));
+      const freeText = (drive: VolumeSpace): string => `${formatSize(drive.free).trim()} free of ${formatSize(drive.total).trim()}`;
+      // One bar width for every drive, sized by the longest "free of" text.
+      const freeW = Math.max(...drives.map((drive) => freeText(drive).length));
+      const barW = Math.max(4, inner - freeW - 4 - 5);
       for (const drive of drives.slice(dialog.scroll, dialog.scroll + fitCount)) {
         const ratio = drive.total > 0 ? drive.used / drive.total : 0;
         const color = ratio >= 0.9 ? RED : ratio >= 0.75 ? YELLOW : GREEN;
@@ -686,9 +690,8 @@ export function runShell(create: ToolFactory): void {
         const where = drive.mount === "/" || drive.mount.endsWith("/" + drive.name) ? "" : "  " + drive.mount;
         const name = fit(drive.name, inner - 2 - tag.length);
         body.push(` ${BOLD}${name}${RESET}${CYAN}${tag}${RESET}${DIM}${fit(where, inner - 1 - visibleWidth(name) - tag.length)}${RESET}`);
-        const free = `${formatSize(drive.free).trim()} free of ${formatSize(drive.total).trim()}`;
+        const free = freeText(drive);
         const percent = `${Math.round(ratio * 100)}%`.padStart(4);
-        const barW = Math.max(4, inner - free.length - percent.length - 5);
         body.push(` ${color}${sizeBar(drive.used, drive.total, barW)}${RESET} ${percent}  ${color}${BOLD}${free}${RESET}`, "");
       }
       const below = drives.length - dialog.scroll - fitCount;
