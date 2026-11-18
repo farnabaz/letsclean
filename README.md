@@ -56,7 +56,7 @@ letsclean --nodejs ~ # find node_modules and build caches
 
 `ctrl-y` also sends the text to your terminal's clipboard with OSC 52, so it lands on your own machine's clipboard when letsclean runs over SSH. This works in iTerm2 (enable *Applications in terminal may access clipboard*), kitty, WezTerm, Ghostty, Alacritty, foot and Windows Terminal; macOS Terminal.app doesn't support it. Inside tmux, set `set -g set-clipboard on` (or `allow-passthrough on`).
 
-`--nodejs` lists directories you can regenerate (`node_modules`, `.next`, `.nuxt`, `.turbo`, `.cache`, and similar) and moves the ones you pick to Trash. Nothing is unlinked. It uses the same keys as the default view; `ctrl-a` then `ctrl-d` trashes everything listed.
+`--nodejs` lists directories you can regenerate (`node_modules`, `.next`, `.nuxt`, `.turbo`, `.yarn/cache`, a project's `.cache`, and similar) and moves the ones you pick to Trash. Nothing is unlinked. It uses the same keys as the default view; `ctrl-a` then `ctrl-d` trashes everything listed.
 
 ## Tools
 
