@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { firmlinkShadows } from "./firmlinks.ts";
 import { formatCount, formatSize } from "./format.ts";
+import { hardLinks } from "./scan.ts";
 import type { Node, ToolFactory } from "./shell.ts";
 
 /**
@@ -27,6 +28,8 @@ const nativePath = fileURLToPath(new URL("../native/build/Release/scannative.nod
  * Two jobs, so the worker never has to report the whole tree back.
  * "find" returns only the junk directories and the names worth descending into.
  * "size" returns the allocated size of one directory, following nothing.
+ * Files with more than one hard link come back separately, so the main thread
+ * can count each of them once across every directory it measures.
  */
 const WORKER_SOURCE = `
 const { parentPort } = require("node:worker_threads");
@@ -46,6 +49,10 @@ function join(parent, name) {
   return parent === "/" ? "/" + name : parent + "/" + name;
 }
 
+function devOf(path) {
+  try { return lstatSync(path).dev; } catch (err) { return 0; }
+}
+
 function scanDir(path) {
   if (native) {
     const handle = native.open(path);
@@ -55,7 +62,12 @@ function scanDir(path) {
         const batch = native.read(handle);
         if (batch.done) break;
         for (let i = 0; i < batch.names.length; i++) {
-          entries.push({ name: batch.names[i], kind: batch.kinds ? batch.kinds[i] : 0, size: batch.sizes ? batch.sizes[i] : 0 });
+          entries.push({
+            name: batch.names[i],
+            kind: batch.kinds ? batch.kinds[i] : 0,
+            size: batch.sizes ? batch.sizes[i] : 0,
+            ino: batch.inos ? batch.inos[i] : 0n,
+          });
         }
       }
     } finally {
@@ -68,6 +80,7 @@ function scanDir(path) {
     name: d.name,
     kind: d.isSymbolicLink() ? 2 : d.isDirectory() ? 1 : 0,
     size: 0,
+    ino: 0n,
   }));
 }
 
@@ -93,6 +106,9 @@ parentPort.on("message", (msg) => {
   }
 
   let size = 0;
+  const devs = [];
+  const inos = [];
+  const linkSizes = [];
   const stack = [msg.path];
   while (stack.length > 0) {
     const current = stack.pop();
@@ -102,11 +118,19 @@ parentPort.on("message", (msg) => {
     } catch (err) {
       continue;
     }
+    let dev = -1;
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       if ((entry.kind & 2) !== 0) continue;
       if ((entry.kind & 1) !== 0) {
         stack.push(join(current, entry.name));
+        continue;
+      }
+      if (entry.ino !== 0n) {
+        if (dev < 0) dev = devOf(current);
+        devs.push(dev);
+        inos.push(entry.ino);
+        linkSizes.push(entry.size);
         continue;
       }
       if (entry.size > 0) {
@@ -115,11 +139,26 @@ parentPort.on("message", (msg) => {
       }
       try {
         const st = lstatSync(join(current, entry.name));
-        size += st.blocks > 0 ? st.blocks * 512 : st.size;
+        const bytes = st.blocks > 0 ? st.blocks * 512 : st.size;
+        if (st.nlink > 1 && st.isFile()) {
+          devs.push(st.dev);
+          // A plain stat rounds inodes above 2^53, which then collide.
+          inos.push(lstatSync(join(current, entry.name), { bigint: true }).ino);
+          linkSizes.push(bytes);
+        } else {
+          size += bytes;
+        }
       } catch (err) {}
     }
   }
-  parentPort.postMessage({ id: msg.id, size: size });
+  const result = {
+    id: msg.id,
+    size: size,
+    devs: new Float64Array(devs),
+    inos: new BigUint64Array(inos),
+    linkSizes: new Float64Array(linkSizes),
+  };
+  parentPort.postMessage(result, [result.devs.buffer, result.inos.buffer, result.linkSizes.buffer]);
 });
 `;
 
@@ -127,7 +166,12 @@ interface FindResult {
   id: number;
   junk?: string[];
   descend?: string[];
+  /** Bytes in files with a single link. */
   size?: number;
+  /** Files with more than one hard link, as parallel arrays. */
+  devs?: Float64Array;
+  inos?: BigUint64Array;
+  linkSizes?: Float64Array;
   error?: string;
 }
 
@@ -152,6 +196,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
     };
 
     const shadows = firmlinkShadows(rootPath);
+    const firstLink = hardLinks();
     let queued = 1;
     let running = 0;
     let found = 0;
@@ -191,7 +236,12 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
       const result = await ask(worker, "size", item.path);
       sizing--;
       if (!item.dead) {
-        item.size = result.size ?? 0;
+        let size = result.size ?? 0;
+        const { devs, inos, linkSizes } = result;
+        if (devs && inos && linkSizes) {
+          for (let i = 0; i < inos.length; i++) if (firstLink(devs[i]!, inos[i]!)) size += linkSizes[i]!;
+        }
+        item.size = size;
         item.pending = 0;
         root.size += item.size;
         root.pending--;

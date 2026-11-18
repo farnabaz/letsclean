@@ -8,6 +8,8 @@ OmniDiskSweeper-style disk explorer for the terminal. Sizes stream in while you 
 
 Directory reads use `readdir` plus `lstat`. On macOS, a local native addon (`getattrlistbulk`: name, type, and allocated size in one syscall per batch) is used automatically if you have built it.
 
+Hard-linked files are counted once, the way `du` counts them, so files that pnpm links into several projects are not counted once per project.
+
 ## Install
 
 Run it without installing:

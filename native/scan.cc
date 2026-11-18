@@ -130,8 +130,9 @@ static napi_value Open(napi_env env, napi_callback_info info) {
 }
 
 // read(handle) -> { names: string[], kinds: Uint8Array, sizes: Float64Array,
-// done: boolean } kinds: 1 directory, 2 symlink, 8 unreadable. Directories
-// report size 0.
+// inos: BigUint64Array, done: boolean } kinds: 1 directory, 2 symlink,
+// 8 unreadable. Directories report size 0. inos holds the inode number of
+// regular files with more than one hard link, and 0 for everything else.
 static napi_value Read(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv;
@@ -146,8 +147,8 @@ static napi_value Read(napi_env env, napi_callback_info info) {
   memset(&attr, 0, sizeof(attr));
   attr.bitmapcount = ATTR_BIT_MAP_COUNT;
   attr.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_ERROR | ATTR_CMN_NAME |
-                    ATTR_CMN_OBJTYPE;
-  attr.fileattr = ATTR_FILE_ALLOCSIZE;
+                    ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID;
+  attr.fileattr = ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE;
 
   int count = getattrlistbulk(scan->fd, &attr, scan->buf, kAttrBuf,
                               FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS);
@@ -170,9 +171,11 @@ static napi_value Read(napi_env env, napi_callback_info info) {
 
   uint8_t *kinds = (uint8_t *)calloc((size_t)count, 1);
   double *sizes = (double *)calloc((size_t)count, sizeof(double));
-  if (!kinds || !sizes) {
+  uint64_t *inos = (uint64_t *)calloc((size_t)count, sizeof(uint64_t));
+  if (!kinds || !sizes || !inos) {
     free(kinds);
     free(sizes);
+    free(inos);
     napi_throw_error(env, NULL, "out of memory");
     return NULL;
   }
@@ -234,6 +237,22 @@ static napi_value Read(napi_env env, napi_callback_info info) {
       field += sizeof(fsobj_type_t);
     }
 
+    uint64_t file_id = 0;
+    if ((returned.commonattr & ATTR_CMN_FILEID) &&
+        field + sizeof(uint64_t) <= rec_end) {
+      memcpy(&file_id, field, sizeof(file_id));
+      field += sizeof(uint64_t);
+    }
+
+    // FSOPT_PACK_INVAL_ATTRS keeps a slot for the link count even where it
+    // is not valid (directories), so always step over it.
+    uint32_t links = 0;
+    if (field + sizeof(uint32_t) <= rec_end) {
+      if (returned.fileattr & ATTR_FILE_LINKCOUNT)
+        memcpy(&links, field, sizeof(links));
+      field += sizeof(uint32_t);
+    }
+
     if ((returned.fileattr & ATTR_FILE_ALLOCSIZE) &&
         field + sizeof(uint64_t) <= rec_end) {
       uint64_t alloc = 0;
@@ -245,6 +264,8 @@ static napi_value Read(napi_env env, napi_callback_info info) {
       kind = (uint8_t)(kind | 8);
     kinds[i] = kind;
     sizes[i] = size;
+    if (kind == 0 && links > 1)
+      inos[i] = file_id;
     cursor += rec_len;
   }
 
@@ -262,8 +283,17 @@ static napi_value Read(napi_env env, napi_callback_info info) {
   napi_create_typedarray(env, napi_float64_array, (size_t)count, sizes_buf, 0,
                          &sizes_arr);
 
+  napi_value inos_buf;
+  napi_create_external_arraybuffer(env, inos, (size_t)count * sizeof(uint64_t),
+                                   FinalizeFree, NULL, &inos_buf);
+  // BigInt: system volume inodes are above 2^53 and would collide as doubles.
+  napi_value inos_arr;
+  napi_create_typedarray(env, napi_biguint64_array, (size_t)count, inos_buf, 0,
+                         &inos_arr);
+
   napi_set_named_property(env, result, "kinds", kinds_arr);
   napi_set_named_property(env, result, "sizes", sizes_arr);
+  napi_set_named_property(env, result, "inos", inos_arr);
   return result;
 }
 
