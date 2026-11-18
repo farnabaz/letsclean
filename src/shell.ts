@@ -186,7 +186,27 @@ function reveal(path: string): void {
   else execFile("xdg-open", [path], () => {});
 }
 
+/** Over SSH the clipboard that matters is the one on the user's own machine. */
+const REMOTE = Boolean(process.env.SSH_TTY || process.env.SSH_CONNECTION || process.env.SSH_CLIENT);
+
+/**
+ * OSC 52 asks the terminal emulator itself to set the clipboard, so it reaches
+ * the local machine even through SSH. Terminals without support ignore it.
+ * Inside tmux the plain sequence only gets through with `set-clipboard on`,
+ * so also send it wrapped in tmux passthrough (needs `allow-passthrough on`).
+ */
+function copyViaTerminal(text: string): void {
+  const seq = `\x1b]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+  let out = seq;
+  if (process.env.TMUX) out += `\x1bPtmux;${seq.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`;
+  else if (process.env.STY) out += `\x1bP${seq}\x1b\\`;
+  process.stdout.write(out);
+}
+
 function copyText(text: string): void {
+  copyViaTerminal(text);
+  // The remote machine's clipboard is out of reach (and usually headless).
+  if (REMOTE) return;
   const os = platform();
   if (os === "darwin") {
     const child = spawn("pbcopy");
