@@ -2,6 +2,7 @@ import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { firmlinkShadows } from "./firmlinks.ts";
+import { pseudoMounts } from "./pseudofs.ts";
 import { formatCount, formatSize } from "./format.ts";
 import { hardLinks } from "./scan.ts";
 import type { Node, ToolFactory } from "./shell.ts";
@@ -198,6 +199,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
 
     const shadows = firmlinkShadows(rootPath);
     const firstLink = hardLinks();
+    for (const mount of pseudoMounts(rootPath)) shadows.add(mount);
     let queued = 1;
     let running = 0;
     let found = 0;
@@ -288,7 +290,8 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
         }
         for (const name of result.descend ?? []) {
           const path = dir === "/" ? "/" + name : dir + "/" + name;
-          // Firmlink twin of a path already being walked; would list every hit twice.
+          // Firmlink twin of a path already being walked (would list every hit twice),
+          // or an in-memory filesystem like /proc.
           if (shadows.has(path)) continue;
           queued++;
           void walk(path);
