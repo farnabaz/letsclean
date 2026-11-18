@@ -1,8 +1,9 @@
 import { execFile } from "node:child_process";
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { lstat, readdir } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { linuxMounts } from "./volume.ts";
 
 // Paths arrive as argv, so nothing needs escaping. Build the list outside the
 // Finder block: `POSIX file` inside it resolves against Finder's terminology.
@@ -80,27 +81,6 @@ async function readTrashDir(dir: string, volume: string): Promise<TrashEntry[]> 
     if (code === "ENOENT" || code === "ENOTDIR" || code === "EACCES" || code === "EPERM") return [];
     throw error;
   }
-}
-
-// Pseudo and image filesystems never hold a user Trash.
-const SKIP_FS = new Set(["squashfs", "tmpfs", "devtmpfs", "overlay", "proc", "sysfs", "ramfs"]);
-
-/** Real block-device mounts, from /proc/self/mounts. */
-async function linuxMounts(): Promise<string[]> {
-  let text: string;
-  try {
-    text = await readFile("/proc/self/mounts", "utf8");
-  } catch {
-    return [];
-  }
-  const out = new Set<string>();
-  for (const line of text.split("\n")) {
-    const [device, mount, type] = line.split(" ");
-    if (!device || !mount || !type || !device.startsWith("/dev/") || SKIP_FS.has(type)) continue;
-    // Spaces and friends are octal-escaped, e.g. "\040".
-    out.add(mount.replace(/\\([0-7]{3})/g, (_, octal: string) => String.fromCharCode(parseInt(octal, 8))));
-  }
-  return [...out];
 }
 
 /**

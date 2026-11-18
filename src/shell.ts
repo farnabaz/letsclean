@@ -5,7 +5,7 @@ import { basename } from "node:path";
 import type { SizedPath } from "./trash.ts";
 import { emptyTrash, listTrash, sizePaths, trash, trashMany } from "./trash.ts";
 import type { VolumeSpace } from "./volume.ts";
-import { volumeSpace } from "./volume.ts";
+import { listVolumes } from "./volume.ts";
 import { fit, formatCount, formatSize, padRight, sizeBar, visibleWidth } from "./format.ts";
 
 /**
@@ -137,7 +137,7 @@ type Overlay =
       scroll: number;
       busy: boolean;
     }
-  | { type: "space"; info: VolumeSpace | null; error: string };
+  | { type: "space"; drives: VolumeSpace[] | null; error: string; scroll: number };
 
 interface Command {
   title: string;
@@ -364,7 +364,7 @@ export function runShell(create: ToolFactory): void {
   // ctrl-k palette. Add new entries here.
   const commands: Command[] = [
     { title: "Empty Trash", hint: "see what is in the Trash, then empty it", run: openTrash },
-    { title: "Show free space", hint: "space left on this volume", run: openSpace },
+    { title: "Show free space", hint: "space left on every drive", run: openSpace },
   ];
 
   function paletteMatches(query: string): Command[] {
@@ -421,11 +421,12 @@ export function runShell(create: ToolFactory): void {
   }
 
   function openSpace(): void {
-    const dialog: Overlay & { type: "space" } = { type: "space", info: null, error: "" };
+    const previous = state.overlay?.type === "space" ? state.overlay : null;
+    const dialog: Overlay & { type: "space" } = { type: "space", drives: previous?.drives ?? null, error: "", scroll: previous?.scroll ?? 0 };
     state.overlay = dialog;
-    volumeSpace(tool.path(tool.root))
-      .then((info) => {
-        dialog.info = info;
+    listVolumes(tool.path(tool.root))
+      .then((drives) => {
+        dialog.drives = drives;
       })
       .catch((error: unknown) => {
         dialog.error = oneLine(error, "could not read free space");
@@ -670,22 +671,33 @@ export function runShell(create: ToolFactory): void {
   }
 
   function renderSpace(dialog: Overlay & { type: "space" }): string {
-    const width = Math.min(cols - 4, 56);
+    const width = Math.min(cols - 4, 64);
     const inner = width - 2;
     const body: string[] = [BOLD + " Free space" + RESET, ""];
-    const info = dialog.info;
-    if (info) {
-      const ratio = info.total > 0 ? info.used / info.total : 0;
-      const color = ratio >= 0.9 ? RED : ratio >= 0.75 ? YELLOW : GREEN;
-      const percent = `${Math.round(ratio * 100)}% used`;
-      const barW = Math.max(4, inner - percent.length - 4);
-      body.push(` ${DIM}Volume${RESET}  ${fit(info.mount, inner - 10)}`, "");
-      body.push(` ${color}${sizeBar(info.used, info.total, barW)}${RESET}  ${percent}`, "");
-      body.push(` ${DIM}Total${RESET}   ${formatSize(info.total)}`);
-      body.push(` ${DIM}Used${RESET}    ${formatSize(info.used)}`);
-      body.push(` ${DIM}Free${RESET}    ${BOLD}${color}${formatSize(info.free)}${RESET}`);
+    const drives = dialog.drives;
+    if (drives && drives.length > 0) {
+      // Each drive takes three lines; keep the box on screen.
+      const fitCount = Math.max(1, Math.floor((rows - 8) / 3));
+      dialog.scroll = Math.max(0, Math.min(dialog.scroll, drives.length - fitCount));
+      for (const drive of drives.slice(dialog.scroll, dialog.scroll + fitCount)) {
+        const ratio = drive.total > 0 ? drive.used / drive.total : 0;
+        const color = ratio >= 0.9 ? RED : ratio >= 0.75 ? YELLOW : GREEN;
+        const tag = drive.current ? "  this folder" : "";
+        const where = drive.mount === "/" || drive.mount.endsWith("/" + drive.name) ? "" : "  " + drive.mount;
+        const name = fit(drive.name, inner - 2 - tag.length);
+        body.push(` ${BOLD}${name}${RESET}${CYAN}${tag}${RESET}${DIM}${fit(where, inner - 1 - visibleWidth(name) - tag.length)}${RESET}`);
+        const free = `${formatSize(drive.free).trim()} free of ${formatSize(drive.total).trim()}`;
+        const percent = `${Math.round(ratio * 100)}%`.padStart(4);
+        const barW = Math.max(4, inner - free.length - percent.length - 5);
+        body.push(` ${color}${sizeBar(drive.used, drive.total, barW)}${RESET} ${percent}  ${color}${BOLD}${free}${RESET}`, "");
+      }
+      const below = drives.length - dialog.scroll - fitCount;
+      if (dialog.scroll > 0 || below > 0) body.push(DIM + ` ${dialog.scroll > 0 ? "↑ more  " : ""}${below > 0 ? `↓ ${formatCount(below)} more` : ""}` + RESET);
+      else body.pop();
     } else if (dialog.error) {
       body.push(RED + " " + fit(dialog.error, inner - 2) + RESET);
+    } else if (drives) {
+      body.push(DIM + " no drives found" + RESET);
     } else {
       body.push(DIM + " reading…" + RESET);
     }
@@ -931,6 +943,8 @@ export function runShell(create: ToolFactory): void {
     if (overlay.type === "space") {
       if (char === "r") openSpace();
       else if (kind === "escape") state.overlay = null;
+      else if (kind === "up" || kind === "k") overlay.scroll = Math.max(0, overlay.scroll - 1);
+      else if (kind === "down" || kind === "j") overlay.scroll++;
       return;
     }
     if (overlay.busy) return;
