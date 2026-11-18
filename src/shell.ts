@@ -1,7 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import { platform } from "node:os";
 import { lstatSync } from "node:fs";
-import { trash, trashMany } from "./trash.ts";
+import { basename } from "node:path";
+import type { SizedPath } from "./trash.ts";
+import { emptyTrash, listTrash, sizePaths, trash, trashMany } from "./trash.ts";
+import type { VolumeSpace } from "./volume.ts";
+import { listVolumes } from "./volume.ts";
 import { fit, formatCount, formatSize, padRight, sizeBar, visibleWidth } from "./format.ts";
 
 /**
@@ -79,6 +83,8 @@ const SELECT = "\x1b[48;5;24m\x1b[97m";
 const OPEN = "\x1b[48;5;236m";
 const BAR = "\x1b[38;5;73m";
 const HEADER = "\x1b[48;5;234m\x1b[97m";
+const PANEL = "\x1b[48;5;235m\x1b[97m";
+const DANGER = "\x1b[41m\x1b[97m";
 
 interface ColCache {
   gen: number;
@@ -117,6 +123,28 @@ function sumSize(nodes: Node[]): number {
   return total;
 }
 
+/** A modal box drawn over the columns; it takes every key while open. */
+type Overlay =
+  | { type: "palette"; query: string; index: number }
+  | {
+      type: "trash";
+      /** `null` until Finder has listed the Trash. */
+      items: SizedPath[] | null;
+      sizing: boolean;
+      error: string;
+      /** Which button has focus: 0 empty, 1 cancel. */
+      focus: number;
+      scroll: number;
+      busy: boolean;
+    }
+  | { type: "space"; drives: VolumeSpace[] | null; error: string; scroll: number };
+
+interface Command {
+  title: string;
+  hint: string;
+  run(): void;
+}
+
 interface UIState {
   stack: Node[];
   cursor: Node | null;
@@ -130,6 +158,7 @@ interface UIState {
   message: string;
   messageUntil: number;
   busy: boolean;
+  overlay: Overlay | null;
 }
 
 let restored = false;
@@ -202,6 +231,7 @@ export function runShell(create: ToolFactory): void {
     message: "",
     messageUntil: 0,
     busy: false,
+    overlay: null,
   };
 
   let cols = process.stdout.columns || 80;
@@ -331,6 +361,100 @@ export function runShell(create: ToolFactory): void {
     }
   }
 
+  // ctrl-k palette. Add new entries here.
+  const commands: Command[] = [
+    { title: "Empty Trash", hint: "see what is in the Trash, then empty it", run: openTrash },
+    { title: "Show free space", hint: "space left on every drive", run: openSpace },
+  ];
+
+  function paletteMatches(query: string): Command[] {
+    const q = query.toLowerCase();
+    return commands.filter((command) => !q || command.title.toLowerCase().includes(q) || command.hint.toLowerCase().includes(q));
+  }
+
+  function openTrash(): void {
+    const dialog: Overlay & { type: "trash" } = { type: "trash", items: null, sizing: false, error: "", focus: 1, scroll: 0, busy: false };
+    state.overlay = dialog;
+    const closed = (): boolean => state.overlay !== dialog;
+    listTrash()
+      .then(async (paths) => {
+        if (closed()) return;
+        dialog.items = paths.map(({ path, volume }) => ({ path, volume, size: 0, done: false }));
+        dialog.sizing = true;
+        scheduleRender(true);
+        await sizePaths(dialog.items, () => scheduleRender(false), closed);
+      })
+      .catch((error: unknown) => {
+        dialog.error = oneLine(error, "could not read the Trash");
+      })
+      .finally(() => {
+        dialog.sizing = false;
+        scheduleRender(false);
+      });
+  }
+
+  async function confirmEmptyTrash(dialog: Overlay & { type: "trash" }): Promise<void> {
+    if (dialog.busy) return;
+    dialog.busy = true;
+    dialog.error = "";
+    scheduleRender(true);
+    try {
+      await emptyTrash();
+      const items = dialog.items ?? [];
+      const freed = items.reduce((total, item) => total + item.size, 0);
+      // The scan may have walked into the Trash; drop what is gone now.
+      for (const item of items) {
+        const node = findNode(item.path);
+        if (!node || !node.parent) continue;
+        tool.detach(node);
+        node.dead = true;
+      }
+      settleAfterRemoval();
+      if (state.overlay === dialog) state.overlay = null;
+      note(freed > 0 ? `emptied Trash, freed ${formatSize(freed).trim()}` : "emptied Trash");
+    } catch (error) {
+      dialog.error = oneLine(error, "could not empty the Trash");
+    } finally {
+      dialog.busy = false;
+      scheduleRender(true);
+    }
+  }
+
+  function openSpace(): void {
+    const previous = state.overlay?.type === "space" ? state.overlay : null;
+    const dialog: Overlay & { type: "space" } = { type: "space", drives: previous?.drives ?? null, error: "", scroll: previous?.scroll ?? 0 };
+    state.overlay = dialog;
+    listVolumes(tool.path(tool.root))
+      .then((drives) => {
+        dialog.drives = drives;
+      })
+      .catch((error: unknown) => {
+        dialog.error = oneLine(error, "could not read free space");
+      })
+      .finally(() => scheduleRender(false));
+  }
+
+  /** The tree node for an absolute path, if the scan has reached it. */
+  function findNode(path: string): Node | null {
+    const rootPath = tool.path(tool.root);
+    const prefix = rootPath.endsWith("/") ? rootPath : rootPath + "/";
+    if (!path.startsWith(prefix)) return null;
+    let node = tool.root;
+    for (const name of path.slice(prefix.length).split("/")) {
+      const next = node.children?.find((child) => child.name === name && !child.dead);
+      if (!next) return null;
+      node = next;
+    }
+    return tool.path(node) === path ? node : null;
+  }
+
+  /** Fix up stack, cursor and selection after nodes died outside confirmTrash. */
+  function settleAfterRemoval(): void {
+    for (const node of state.marked) if (node.dead) state.marked.delete(node);
+    while (state.stack.length > 1 && state.stack.some((dir) => dir.dead)) back();
+    if (state.cursor?.dead) state.cursor = null;
+  }
+
   function scheduleRender(immediate: boolean): void {
     if (stopped) return;
     if (immediate) {
@@ -456,13 +580,149 @@ export function runShell(create: ToolFactory): void {
     } else {
       const hidden = tool.hiddenToggle ? `  ${BOLD}.${RESET} ${state.showHidden ? "shown" : "hidden"}` : "";
       const nav = state.stack.length > 1 || activeList().some(canOpen) ? `  ${BOLD}→${RESET} open  ${BOLD}←${RESET} back` : "";
-      foot = ` ${BOLD}↑↓${RESET} move${nav}  ${BOLD}space${RESET} select  ${BOLD}^o${RESET} finder  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
+      foot = ` ${BOLD}↑↓${RESET} move${nav}  ${BOLD}space${RESET} select  ${BOLD}^k${RESET} commands  ${BOLD}^o${RESET} finder  ${BOLD}^d${RESET} trash  ${BOLD}^y${RESET} copy${hidden}  ${BOLD}/${RESET} filter  ${BOLD}?${RESET} help  ${BOLD}q${RESET} quit`;
     }
     lines.push(padVisible(foot, cols));
 
     let frame = "\x1b[H" + lines.join("\n");
     if (state.help) frame += renderHelp();
+    else if (state.overlay) frame += renderOverlay(state.overlay, now);
     return frame;
+  }
+
+  function renderOverlay(overlay: Overlay, now: number): string {
+    if (overlay.type === "palette") return renderPalette(overlay);
+    if (overlay.type === "trash") return renderTrash(overlay, now);
+    return renderSpace(overlay);
+  }
+
+  function renderPalette(palette: Overlay & { type: "palette" }): string {
+    const width = Math.min(cols - 4, 64);
+    const inner = width - 2;
+    const list = paletteMatches(palette.query);
+    palette.index = Math.max(0, Math.min(list.length - 1, palette.index));
+    const body: string[] = [BOLD + " Commands" + RESET, " " + CYAN + "›" + RESET + " " + fit(palette.query, inner - 5) + "▍", ""];
+    if (list.length === 0) body.push(DIM + " no matching command" + RESET);
+    const titleW = Math.min(20, Math.max(...commands.map((command) => command.title.length)) + 2);
+    list.forEach((command, i) => {
+      const selected = i === palette.index;
+      const title = padRight(command.title, titleW);
+      const hint = fit(command.hint, Math.max(0, inner - titleW - 3));
+      body.push(selected ? `${SELECT} ${BOLD}${title}${RESET}${SELECT} ${hint}` : ` ${title} ${DIM}${hint}${RESET}`);
+    });
+    body.push("", DIM + " ↑↓ choose   enter run   esc close" + RESET);
+    return renderBox(body, width, null);
+  }
+
+  function renderTrash(dialog: Overlay & { type: "trash" }, now: number): string {
+    const width = Math.min(cols - 4, 72);
+    const inner = width - 2;
+    const items = dialog.items;
+    const spin = SPIN[Math.floor(now / 80) % SPIN.length];
+    const total = items ? items.reduce((sum, item) => sum + item.size, 0) : 0;
+    let summary = "";
+    if (items && items.length > 0) {
+      summary = `${formatCount(items.length)} item${items.length === 1 ? "" : "s"}  ${formatSize(total).trim()}${dialog.sizing ? " " + spin : ""}`;
+    }
+    const title = " Empty Trash";
+    const body: string[] = [BOLD + title + RESET + " ".repeat(Math.max(1, inner - title.length - summary.length - 1)) + YELLOW + summary + RESET, ""];
+
+    // Leave room for the header, buttons, hints and box borders.
+    const listH = Math.max(1, Math.min(items?.length ?? 1, rows - 12));
+    if (!items) {
+      if (dialog.error) {
+        body.push(RED + " " + fit(dialog.error, inner - 2) + RESET);
+        body.push(DIM + " Could not list it; emptying may still work." + RESET);
+      } else {
+        body.push(DIM + ` ${spin} reading Trash…` + RESET);
+      }
+    } else if (items.length === 0) {
+      body.push(DIM + " The Trash is empty." + RESET);
+    } else {
+      const sorted = items.slice().sort((a, b) => b.size - a.size || (a.path < b.path ? -1 : 1));
+      dialog.scroll = Math.max(0, Math.min(dialog.scroll, sorted.length - listH));
+      for (const item of sorted.slice(dialog.scroll, dialog.scroll + listH)) {
+        const name = basename(item.path) + (item.done ? "" : " …");
+        const drive = item.volume ? fit(" · " + item.volume, Math.floor((inner - 12) / 3)) : "";
+        body.push(` ${GREEN}${formatSize(item.size)}${RESET}  ${fit(name, inner - 12 - visibleWidth(drive))}${DIM}${drive}${RESET}`);
+      }
+      const above = dialog.scroll;
+      const below = sorted.length - dialog.scroll - listH;
+      if (above > 0 || below > 0) {
+        body.push(DIM + ` ${above > 0 ? `↑ ${formatCount(above)} more` : ""}${above > 0 && below > 0 ? "   " : ""}${below > 0 ? `↓ ${formatCount(below)} more` : ""}` + RESET);
+      }
+    }
+    body.push("");
+    if (dialog.error && items) body.push(RED + " " + fit(dialog.error, inner - 2) + RESET, "");
+
+    const empty = items !== null && items.length === 0 && !dialog.error;
+    if (dialog.busy) {
+      body.push(YELLOW + ` ${spin} emptying Trash…` + RESET);
+    } else if (empty) {
+      body.push(" " + SELECT + BOLD + " Close " + RESET);
+      body.push("", DIM + " enter / esc close" + RESET);
+    } else {
+      const emptyBtn = dialog.focus === 0 ? `${DANGER}${BOLD} Empty Trash ${RESET}` : `${RED}[ Empty Trash ]${RESET}`;
+      const cancelBtn = dialog.focus === 1 ? `${SELECT}${BOLD} Cancel ${RESET}` : "[ Cancel ]";
+      body.push(` ${emptyBtn}   ${cancelBtn}`);
+      body.push("", DIM + fit(" Permanently deletes these. y empty  n cancel  ←→ choose  enter", inner) + RESET);
+    }
+    return renderBox(body, width, null);
+  }
+
+  function renderSpace(dialog: Overlay & { type: "space" }): string {
+    const width = Math.min(cols - 4, 64);
+    const inner = width - 2;
+    const body: string[] = [BOLD + " Free space" + RESET, ""];
+    const drives = dialog.drives;
+    if (drives && drives.length > 0) {
+      // Each drive takes three lines; keep the box on screen.
+      const fitCount = Math.max(1, Math.floor((rows - 8) / 3));
+      dialog.scroll = Math.max(0, Math.min(dialog.scroll, drives.length - fitCount));
+      const freeText = (drive: VolumeSpace): string => `${formatSize(drive.free).trim()} free of ${formatSize(drive.total).trim()}`;
+      // One bar width for every drive, sized by the longest "free of" text.
+      const freeW = Math.max(...drives.map((drive) => freeText(drive).length));
+      const barW = Math.max(4, inner - freeW - 4 - 5);
+      for (const drive of drives.slice(dialog.scroll, dialog.scroll + fitCount)) {
+        const ratio = drive.total > 0 ? drive.used / drive.total : 0;
+        const color = ratio >= 0.9 ? RED : ratio >= 0.75 ? YELLOW : GREEN;
+        const tag = drive.current ? "  this folder" : "";
+        const where = drive.mount === "/" || drive.mount.endsWith("/" + drive.name) ? "" : "  " + drive.mount;
+        const name = fit(drive.name, inner - 2 - tag.length);
+        body.push(` ${BOLD}${name}${RESET}${CYAN}${tag}${RESET}${DIM}${fit(where, inner - 1 - visibleWidth(name) - tag.length)}${RESET}`);
+        const free = freeText(drive);
+        const percent = `${Math.round(ratio * 100)}%`.padStart(4);
+        body.push(` ${color}${sizeBar(drive.used, drive.total, barW)}${RESET} ${percent}  ${color}${BOLD}${free}${RESET}`, "");
+      }
+      const below = drives.length - dialog.scroll - fitCount;
+      if (dialog.scroll > 0 || below > 0) body.push(DIM + ` ${dialog.scroll > 0 ? "↑ more  " : ""}${below > 0 ? `↓ ${formatCount(below)} more` : ""}` + RESET);
+      else body.pop();
+    } else if (dialog.error) {
+      body.push(RED + " " + fit(dialog.error, inner - 2) + RESET);
+    } else if (drives) {
+      body.push(DIM + " no drives found" + RESET);
+    } else {
+      body.push(DIM + " reading…" + RESET);
+    }
+    body.push("", DIM + " r refresh   esc close" + RESET);
+    return renderBox(body, width, null);
+  }
+
+  /** Draw lines (which may carry color) in a bordered box centered on screen. */
+  function renderBox(body: string[], width: number, style: string | null): string {
+    const bg = style ?? PANEL;
+    const inner = width - 2;
+    const top = Math.max(1, Math.floor((rows - body.length - 2) / 2));
+    const left = Math.max(0, Math.floor((cols - width) / 2));
+    const border = DIM + CYAN;
+    let out = `\x1b[${top};${left + 1}H${bg}${border}┌${"─".repeat(inner)}┐${RESET}`;
+    for (let i = 0; i < body.length; i++) {
+      // Colors inside a line end with RESET; put the panel background back.
+      const line = padVisible(body[i]!, inner).replaceAll(RESET, RESET + bg);
+      out += `\x1b[${top + 1 + i};${left + 1}H${bg}${border}│${RESET}${bg}${line}${bg}${border}│${RESET}`;
+    }
+    out += `\x1b[${top + 1 + body.length};${left + 1}H${bg}${border}└${"─".repeat(inner)}┘${RESET}`;
+    return out;
   }
 
   function renderHelp(): string {
@@ -480,6 +740,7 @@ export function runShell(create: ToolFactory): void {
       "ctrl-o        reveal in Finder",
       "ctrl-d        move to Trash (selection)",
       "ctrl-y        copy path (selection)",
+      "ctrl-k        commands (Trash, free space)",
       ...(tool.hiddenToggle ? [".            toggle hidden files"] : []),
       "/            filter this column",
       "?            this help",
@@ -540,6 +801,10 @@ export function runShell(create: ToolFactory): void {
   function handleKey(kind: string, char: string): void {
     if (state.help) {
       state.help = false;
+      return;
+    }
+    if (state.overlay) {
+      handleOverlayKey(state.overlay, kind, char);
       return;
     }
     if (state.confirm) {
@@ -625,6 +890,9 @@ export function runShell(create: ToolFactory): void {
       case "help":
         state.help = true;
         return;
+      case "palette":
+        state.overlay = { type: "palette", query: "", index: 0 };
+        return;
       case "hidden":
         if (!tool.hiddenToggle) return;
         state.showHidden = !state.showHidden;
@@ -647,6 +915,81 @@ export function runShell(create: ToolFactory): void {
       }
       default:
         return;
+    }
+  }
+
+  function handleOverlayKey(overlay: Overlay, kind: string, char: string): void {
+    if (kind === "quit" && char === "\x03") {
+      shutdown();
+      return;
+    }
+    if (overlay.type === "palette") {
+      if (kind === "escape" || kind === "palette") {
+        state.overlay = null;
+      } else if (kind === "up") {
+        overlay.index = Math.max(0, overlay.index - 1);
+      } else if (kind === "down" || kind === "toggle") {
+        overlay.index++;
+      } else if (kind === "enter") {
+        const command = paletteMatches(overlay.query)[overlay.index];
+        state.overlay = null;
+        command?.run();
+      } else if (kind === "backspace") {
+        overlay.query = overlay.query.slice(0, -1);
+        overlay.index = 0;
+      } else if (char.length === 1 && char >= " " && char !== "\x7f") {
+        overlay.query += char;
+        overlay.index = 0;
+      }
+      return;
+    }
+    if (overlay.type === "space") {
+      if (char === "r") openSpace();
+      else if (kind === "escape") state.overlay = null;
+      else if (kind === "up" || kind === "k") overlay.scroll = Math.max(0, overlay.scroll - 1);
+      else if (kind === "down" || kind === "j") overlay.scroll++;
+      return;
+    }
+    if (overlay.busy) return;
+    const isEmpty = overlay.items !== null && overlay.items.length === 0 && !overlay.error;
+    if (isEmpty) {
+      if (kind === "escape" || kind === "enter") state.overlay = null;
+      return;
+    }
+    switch (kind) {
+      case "up":
+      case "k":
+        overlay.scroll = Math.max(0, overlay.scroll - 1);
+        return;
+      case "down":
+      case "j":
+        overlay.scroll++;
+        return;
+      case "pageup":
+        overlay.scroll = Math.max(0, overlay.scroll - (rows - 12));
+        return;
+      case "pagedown":
+        overlay.scroll += rows - 12;
+        return;
+      case "left":
+      case "right":
+      case "h":
+      case "l":
+      case "toggle":
+        overlay.focus = overlay.focus === 0 ? 1 : 0;
+        return;
+      case "enter":
+        if (overlay.focus === 0) void confirmEmptyTrash(overlay);
+        else state.overlay = null;
+        return;
+      case "escape":
+      case "quit":
+      case "palette":
+        state.overlay = null;
+        return;
+      default:
+        if (char === "y" || char === "Y") void confirmEmptyTrash(overlay);
+        else if (char === "n" || char === "N") state.overlay = null;
     }
   }
 
@@ -759,7 +1102,7 @@ export function runShell(create: ToolFactory): void {
   scheduleRender(true);
   // Keep the spinner and timer moving even when the tool is quiet.
   setInterval(() => {
-    if (scanning) scheduleRender(false);
+    if (scanning || (state.overlay?.type === "trash" && (state.overlay.busy || state.overlay.items === null))) scheduleRender(false);
   }, 250).unref();
 }
 
@@ -804,6 +1147,10 @@ function paintNode(node: Node, width: number, siblings: Node[], selected: boolea
     (selected ? SELECT : YELLOW) +
     pending;
   return padVisible(core, width + 1);
+}
+
+function oneLine(error: unknown, fallback: string): string {
+  return (error instanceof Error ? error.message : fallback).replaceAll("\n", " ").slice(0, 160) || fallback;
 }
 
 function paintColumns(cells: string[], widths: number[], style: string, styles?: string[]): string {
@@ -871,6 +1218,7 @@ function readKey(text: string, index: number): Key {
   if (char === "\x04") return { kind: "delete", char, length: 1 };
   if (char === "\x19") return { kind: "yank", char, length: 1 };
   if (char === "\x11") return { kind: "quit", char, length: 1 };
+  if (char === "\x0b") return { kind: "palette", char, length: 1 };
   if (char === "q") return { kind: "quit", char, length: 1 };
   if (char === "?") return { kind: "help", char, length: 1 };
   if (char === "/") return { kind: "filter", char, length: 1 };

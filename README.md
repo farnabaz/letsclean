@@ -46,6 +46,7 @@ letsclean --nodejs ~ # find node_modules and build caches
 | `ctrl-o` | reveal in Finder |
 | `ctrl-d` | move to Trash (all selected rows) |
 | `ctrl-y` | copy path (all selected rows, one per line) |
+| `ctrl-k` | commands: empty Trash (lists what's in it first), free space on every drive |
 | `.` | toggle hidden files |
 | `/` | filter the column |
 | `?` | help |
