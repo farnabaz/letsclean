@@ -9,17 +9,13 @@ import type { Node, ToolFactory } from "./shell.ts";
  * Directories that hold nothing you cannot regenerate. node_modules reinstalls;
  * the rest are build and tool caches.
  */
-const JUNK = new Set([
-  "node_modules",
-  ".nuxt",
-  ".next",
-  ".turbo",
-  ".output",
-  ".cache",
-  ".parcel-cache",
-  ".vite",
-  ".yarn",
-]);
+const JUNK = new Set(["node_modules", ".nuxt", ".next", ".turbo", ".output", ".parcel-cache", ".vite"]);
+
+/** Junk only next to a package.json: ~/.cache and friends hold other apps' data. */
+const PROJECT_JUNK = new Set([".cache"]);
+
+/** The regenerable parts of .yarn. Its releases/ and plugins/ are committed and needed. */
+const YARN_JUNK = new Set(["cache", "unplugged"]);
 
 const nativePath = fileURLToPath(new URL("../native/build/Release/scannative.node", import.meta.url));
 
@@ -41,6 +37,8 @@ try {
 }
 
 const JUNK = new Set(${JSON.stringify([...JUNK])});
+const PROJECT_JUNK = new Set(${JSON.stringify([...PROJECT_JUNK])});
+const YARN_JUNK = new Set(${JSON.stringify([...YARN_JUNK])});
 
 function join(parent, name) {
   return parent === "/" ? "/" + name : parent + "/" + name;
@@ -82,11 +80,14 @@ parentPort.on("message", (msg) => {
     }
     const junk = [];
     const descend = [];
+    const inYarn = msg.path.endsWith("/.yarn");
+    const isProject = entries.some((entry) => entry.name === "package.json" && (entry.kind & 1) === 0);
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       if ((entry.kind & 2) !== 0 || (entry.kind & 1) === 0) continue;
-      if (JUNK.has(entry.name)) junk.push(entry.name);
-      else descend.push(entry.name);
+      const name = entry.name;
+      if (JUNK.has(name) || (isProject && PROJECT_JUNK.has(name)) || (inYarn && YARN_JUNK.has(name))) junk.push(name);
+      else descend.push(name);
     }
     parentPort.postMessage({ id: msg.id, junk: junk, descend: descend });
     return;
@@ -258,7 +259,10 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
       root,
       help: [
         "Finds directories you can regenerate:",
-        [...JUNK].join("  "),
+        "node_modules  .nuxt  .next  .turbo",
+        ".output  .parcel-cache  .vite",
+        ".yarn/cache  .yarn/unplugged",
+        ".cache next to a package.json",
         "",
         "Nothing is deleted outright. Trash",
         "always asks for confirmation first.",
