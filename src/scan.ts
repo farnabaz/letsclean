@@ -2,6 +2,7 @@ import { availableParallelism } from "node:os";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { firmlinkShadows } from "./firmlinks.ts";
+import { pseudoMounts } from "./pseudofs.ts";
 
 /**
  * Directory reads run in worker threads so the UI never blocks. On macOS each
@@ -112,7 +113,9 @@ parentPort.on("message", async (msg) => {
       }
       try {
         const st = lstatSync(path === "/" ? "/" + name : path + "/" + name);
-        sizes[i] = st.blocks > 0 ? st.blocks * 512 : st.size;
+        // Allocated size, not apparent size: a sparse file or /proc/kcore has
+        // few or no blocks. Windows reports no blocks, so use size there.
+        sizes[i] = process.platform === "win32" ? st.size : st.blocks * 512;
         if (st.nlink > 1 && st.isFile()) {
           // A plain stat rounds inodes above 2^53, which then collide.
           inos[i] = lstatSync(path === "/" ? "/" + name : path + "/" + name, { bigint: true }).ino;
@@ -389,6 +392,7 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
 
   const shadows = firmlinkShadows(rootPath);
   const firstLink = hardLinks();
+  const skipped = pseudoMounts(rootPath);
   const heap = new Heap();
   let seq = 0;
   let nextId = 1;
@@ -508,6 +512,8 @@ export function startScan(rootPath: string, onActivity: () => void): Scanner {
         // would double the size. Leaving it out also keeps it from being trashed
         // under its second name.
         if (shadows.has(childPath)) continue;
+        // /proc, /sys and other in-memory filesystems hold nothing on disk.
+        if (skipped.has(childPath)) continue;
         const child: Entry = {
           name,
           path: childPath,
