@@ -19,6 +19,21 @@ const PROJECT_JUNK = new Set([".cache"]);
 /** The regenerable parts of .yarn. Its releases/ and plugins/ are committed and needed. */
 const YARN_JUNK = new Set(["cache", "unplugged"]);
 
+/**
+ * macOS directories whose node_modules belong to installed software, not to
+ * your projects: app bundles ship them, and Homebrew formulae depend on them.
+ * Trashing them breaks those programs, so --nodejs never looks inside. The
+ * /System/Volumes/Data twins are listed too, for scans rooted there.
+ */
+const DARWIN_SKIP = ["/Applications", "/opt/homebrew"];
+
+function skippedApps(rootPath: string): string[] {
+  if (process.platform !== "darwin") return [];
+  const paths = DARWIN_SKIP.flatMap((path) => [path, "/System/Volumes/Data" + path]);
+  // Scanning one of them directly still works, as with pseudo filesystems.
+  return paths.filter((path) => path !== rootPath && (rootPath === "/" || path.startsWith(rootPath + "/")));
+}
+
 const nativePath = fileURLToPath(new URL("../native/build/Release/scannative.node", import.meta.url));
 
 /**
@@ -200,6 +215,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
     const shadows = firmlinkShadows(rootPath);
     const firstLink = hardLinks();
     for (const mount of pseudoMounts(rootPath)) shadows.add(mount);
+    for (const path of skippedApps(rootPath)) shadows.add(path);
     let queued = 1;
     let running = 0;
     let found = 0;
@@ -291,7 +307,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
         for (const name of result.descend ?? []) {
           const path = dir === "/" ? "/" + name : dir + "/" + name;
           // Firmlink twin of a path already being walked (would list every hit twice),
-          // or an in-memory filesystem like /proc.
+          // an in-memory filesystem like /proc, or installed software on macOS.
           if (shadows.has(path)) continue;
           queued++;
           void walk(path);
@@ -317,6 +333,7 @@ export function nodeCleanTool(rootPath: string): ToolFactory {
         ".yarn/cache  .yarn/unplugged",
         ".cache next to a package.json",
         "",
+        ...(process.platform === "darwin" ? ["Skips /Applications and", "/opt/homebrew on macOS.", ""] : []),
         "Nothing is deleted outright. Trash",
         "always asks for confirmation first.",
       ],
